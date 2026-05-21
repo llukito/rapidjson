@@ -5,6 +5,5 @@ Name: gmock
 Description: GoogleMock (without main() function)
 Version: @PROJECT_VERSION@
 URL: https://github.com/google/googletest
-Requires: gtest = @PROJECT_VERSION@
 Libs: -L${libdir} -lgmock @CMAKE_THREAD_LIBS_INIT@
-Cflags: -I${includedir} @GTEST_HAS_PTHREAD_MACRO@
+Cflags: -I${includedir} @GTEST_HAS_PTHREAD_MACRO@ @CMAKE_THREAD_LIBS_INIT@
