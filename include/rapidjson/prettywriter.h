@@ -92,17 +92,39 @@ public:
     */
     //@{
 
-    bool Null()                 { PrettyPrefix(kNullType);   return Base::EndValue(Base::WriteNull()); }
-    bool Bool(bool b)           { PrettyPrefix(b ? kTrueType : kFalseType); return Base::EndValue(Base::WriteBool(b)); }
-    bool Int(int i)             { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteInt(i)); }
-    bool Uint(unsigned u)       { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteUint(u)); }
-    bool Int64(int64_t i64)     { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteInt64(i64)); }
-    bool Uint64(uint64_t u64)   { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteUint64(u64));  }
-    bool Double(double d)       { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteDouble(d)); }
+    bool Null() {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Null();
+        PrettyPrefix(kNullType);   return Base::EndValue(Base::WriteNull());
+    }
+    bool Bool(bool b) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Bool(b);
+        PrettyPrefix(b ? kTrueType : kFalseType); return Base::EndValue(Base::WriteBool(b));
+    }
+    bool Int(int i) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Int(i);
+        PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteInt(i));
+    }
+    bool Uint(unsigned u) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Uint(u);
+        PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteUint(u));
+    }
+    bool Int64(int64_t i64) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Int64(i64);
+        PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteInt64(i64));
+    }
+    bool Uint64(uint64_t u64) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Uint64(u64);
+        PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteUint64(u64));
+    }
+    bool Double(double d) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Double(d);
+        PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteDouble(d));
+    }
 
     bool RawNumber(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::RawNumber(str, length, copy);
         PrettyPrefix(kNumberType);
         return Base::EndValue(Base::WriteString(str, length));
     }
@@ -110,6 +132,7 @@ public:
     bool String(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::String(str, length, copy);
         PrettyPrefix(kStringType);
         return Base::EndValue(Base::WriteString(str, length));
     }
@@ -121,25 +144,40 @@ public:
 #endif
 
     bool StartObject() {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::StartObject();
         PrettyPrefix(kObjectType);
         new (Base::level_stack_.template Push<typename Base::Level>()) typename Base::Level(false);
+        if (Base::kSortKeys) {
+            typename Base::Level* lv = Base::level_stack_.template Top<typename Base::Level>();
+            lv->sortBufBase = Base::sortBuf_.GetSize();
+            lv->sortedMemberCount = 0;
+            Base::sortDepth_ = 1;
+        }
         return Base::WriteStartObject();
     }
 
-    bool Key(const Ch* str, SizeType length, bool copy = false) { return String(str, length, copy); }
+    bool Key(const Ch* str, SizeType length, bool copy = false) {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::Key(str, length, copy);
+        return String(str, length, copy);
+    }
 
 #if RAPIDJSON_HAS_STDSTRING
     bool Key(const std::basic_string<Ch>& str) {
         return Key(str.data(), SizeType(str.size()));
     }
 #endif
-	
+
     bool EndObject(SizeType memberCount = 0) {
+        if (Base::kSortKeys && Base::sortDepth_ > 1) return Base::EndObject(memberCount);
+        if (Base::kSortKeys && Base::sortDepth_ == 1) {
+            Base::SortAndReplay(this, memberCount);
+            // Fall through to normal PrettyWriter EndObject path
+        }
         (void)memberCount;
-        RAPIDJSON_ASSERT(Base::level_stack_.GetSize() >= sizeof(typename Base::Level)); // not inside an Object
-        RAPIDJSON_ASSERT(!Base::level_stack_.template Top<typename Base::Level>()->inArray); // currently inside an Array, not Object
-        RAPIDJSON_ASSERT(0 == Base::level_stack_.template Top<typename Base::Level>()->valueCount % 2); // Object has a Key without a Value
-       
+        RAPIDJSON_ASSERT(Base::level_stack_.GetSize() >= sizeof(typename Base::Level));
+        RAPIDJSON_ASSERT(!Base::level_stack_.template Top<typename Base::Level>()->inArray);
+        RAPIDJSON_ASSERT(0 == Base::level_stack_.template Top<typename Base::Level>()->valueCount % 2);
+
         bool empty = Base::level_stack_.template Pop<typename Base::Level>(1)->valueCount == 0;
 
         if (!empty) {
@@ -149,18 +187,20 @@ public:
         bool ret = Base::EndValue(Base::WriteEndObject());
         (void)ret;
         RAPIDJSON_ASSERT(ret == true);
-        if (Base::level_stack_.Empty()) // end of json text
+        if (Base::level_stack_.Empty())
             Base::Flush();
         return true;
     }
 
     bool StartArray() {
+        if (Base::kSortKeys && Base::sortDepth_ > 0) return Base::StartArray();
         PrettyPrefix(kArrayType);
         new (Base::level_stack_.template Push<typename Base::Level>()) typename Base::Level(true);
         return Base::WriteStartArray();
     }
 
     bool EndArray(SizeType memberCount = 0) {
+        if (Base::kSortKeys && Base::sortDepth_ > 1) return Base::EndArray(memberCount);
         (void)memberCount;
         RAPIDJSON_ASSERT(Base::level_stack_.GetSize() >= sizeof(typename Base::Level));
         RAPIDJSON_ASSERT(Base::level_stack_.template Top<typename Base::Level>()->inArray);
@@ -173,7 +213,7 @@ public:
         bool ret = Base::EndValue(Base::WriteEndArray());
         (void)ret;
         RAPIDJSON_ASSERT(ret == true);
-        if (Base::level_stack_.Empty()) // end of json text
+        if (Base::level_stack_.Empty())
             Base::Flush();
         return true;
     }

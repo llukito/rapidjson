@@ -68,6 +68,7 @@ enum WriteFlag {
     kWriteValidateEncodingFlag = 1, //!< Validate encoding of JSON strings.
     kWriteNanAndInfFlag = 2,        //!< Allow writing of Infinity, -Infinity and NaN.
     kWriteNanAndInfNullFlag = 4,    //!< Allow writing of Infinity, -Infinity and NaN as null.
+    kWriteSortedKeyFlag = 8,        //!< Sort object keys in lexicographic (byte-wise) order.
     kWriteDefaultFlags = RAPIDJSON_WRITE_DEFAULT_FLAGS  //!< Default write flags. Can be customized by defining RAPIDJSON_WRITE_DEFAULT_FLAGS
 };
 
@@ -94,6 +95,9 @@ public:
 
     static const int kDefaultMaxDecimalPlaces = 324;
 
+    //! Whether this writer sorts object keys (compile-time constant).
+    static const bool kSortKeys = (writeFlags & kWriteSortedKeyFlag) != 0;
+
     //! Constructor
     /*! \param os Output stream.
         \param stackAllocator User supplied allocator. If it is null, it will create a private one.
@@ -101,15 +105,21 @@ public:
     */
     explicit
     Writer(OutputStream& os, StackAllocator* stackAllocator = 0, size_t levelDepth = kDefaultLevelDepth) : 
-        os_(&os), level_stack_(stackAllocator, levelDepth * sizeof(Level)), maxDecimalPlaces_(kDefaultMaxDecimalPlaces), hasRoot_(false) {}
+        os_(&os), level_stack_(stackAllocator, levelDepth * sizeof(Level)),
+        maxDecimalPlaces_(kDefaultMaxDecimalPlaces), hasRoot_(false),
+        sortBuf_(stackAllocator, 256), sortDepth_(0) {}
 
     explicit
     Writer(StackAllocator* allocator = 0, size_t levelDepth = kDefaultLevelDepth) :
-        os_(0), level_stack_(allocator, levelDepth * sizeof(Level)), maxDecimalPlaces_(kDefaultMaxDecimalPlaces), hasRoot_(false) {}
+        os_(0), level_stack_(allocator, levelDepth * sizeof(Level)),
+        maxDecimalPlaces_(kDefaultMaxDecimalPlaces), hasRoot_(false),
+        sortBuf_(allocator, 256), sortDepth_(0) {}
 
 #if RAPIDJSON_HAS_CXX11_RVALUE_REFS
     Writer(Writer&& rhs) :
-        os_(rhs.os_), level_stack_(std::move(rhs.level_stack_)), maxDecimalPlaces_(rhs.maxDecimalPlaces_), hasRoot_(rhs.hasRoot_) {
+        os_(rhs.os_), level_stack_(std::move(rhs.level_stack_)),
+        maxDecimalPlaces_(rhs.maxDecimalPlaces_), hasRoot_(rhs.hasRoot_),
+        sortBuf_(std::move(rhs.sortBuf_)), sortDepth_(rhs.sortDepth_) {
         rhs.os_ = 0;
     }
 #endif
@@ -136,6 +146,8 @@ public:
         os_ = &os;
         hasRoot_ = false;
         level_stack_.Clear();
+        sortBuf_.Clear();
+        sortDepth_ = 0;
     }
 
     //! Checks whether the output is a complete JSON.
@@ -180,23 +192,52 @@ public:
     */
     //@{
 
-    bool Null()                 { Prefix(kNullType);   return EndValue(WriteNull()); }
-    bool Bool(bool b)           { Prefix(b ? kTrueType : kFalseType); return EndValue(WriteBool(b)); }
-    bool Int(int i)             { Prefix(kNumberType); return EndValue(WriteInt(i)); }
-    bool Uint(unsigned u)       { Prefix(kNumberType); return EndValue(WriteUint(u)); }
-    bool Int64(int64_t i64)     { Prefix(kNumberType); return EndValue(WriteInt64(i64)); }
-    bool Uint64(uint64_t u64)   { Prefix(kNumberType); return EndValue(WriteUint64(u64)); }
+    bool Null() {
+        if (kSortKeys && sortDepth_ > 0) { PushSortEvent(SortedEvent::eNull); if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNullType);   return EndValue(WriteNull());
+    }
+    bool Bool(bool b) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eBool); e->boolVal = b; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(b ? kTrueType : kFalseType); return EndValue(WriteBool(b));
+    }
+    bool Int(int i) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eInt); e->intVal = i; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNumberType); return EndValue(WriteInt(i));
+    }
+    bool Uint(unsigned u) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eUint); e->uintVal = u; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNumberType); return EndValue(WriteUint(u));
+    }
+    bool Int64(int64_t i64) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eInt64); e->int64Val = i64; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNumberType); return EndValue(WriteInt64(i64));
+    }
+    bool Uint64(uint64_t u64) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eUint64); e->uint64Val = u64; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNumberType); return EndValue(WriteUint64(u64));
+    }
 
     //! Writes the given \c double value to the stream
     /*!
         \param d The value to be written.
         \return Whether it is succeed.
     */
-    bool Double(double d)       { Prefix(kNumberType); return EndValue(WriteDouble(d)); }
+    bool Double(double d) {
+        if (kSortKeys && sortDepth_ > 0) { SortedEvent* e = PushSortEvent(SortedEvent::eDouble); e->doubleVal = d; if (sortDepth_ == 1) FinalizeSortedMember(); return true; }
+        Prefix(kNumberType); return EndValue(WriteDouble(d));
+    }
 
     bool RawNumber(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
+        if (kSortKeys && sortDepth_ > 0) {
+            StrRef ref = RecordStrRef(str);
+            SortedEvent* e = PushSortEvent(SortedEvent::eRawNumber);
+            e->strLen = length;
+            PushStrCopy(str, length, ref);
+            if (sortDepth_ == 1) FinalizeSortedMember();
+            return true;
+        }
         Prefix(kNumberType);
         return EndValue(WriteString(str, length));
     }
@@ -204,6 +245,14 @@ public:
     bool String(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
+        if (kSortKeys && sortDepth_ > 0) {
+            StrRef ref = RecordStrRef(str);
+            SortedEvent* e = PushSortEvent(SortedEvent::eString);
+            e->strLen = length;
+            PushStrCopy(str, length, ref);
+            if (sortDepth_ == 1) FinalizeSortedMember();
+            return true;
+        }
         Prefix(kStringType);
         return EndValue(WriteString(str, length));
     }
@@ -215,12 +264,42 @@ public:
 #endif
 
     bool StartObject() {
+        if (kSortKeys && sortDepth_ > 0) {
+            PushSortEvent(SortedEvent::eStartObject);
+            sortDepth_++;
+            return true;
+        }
         Prefix(kObjectType);
         new (level_stack_.template Push<Level>()) Level(false);
+        if (kSortKeys) {
+            Level* level = level_stack_.template Top<Level>();
+            level->sortBufBase = sortBuf_.GetSize();
+            level->sortedMemberCount = 0;
+            sortDepth_ = 1;
+        }
         return WriteStartObject();
     }
 
-    bool Key(const Ch* str, SizeType length, bool copy = false) { return String(str, length, copy); }
+    bool Key(const Ch* str, SizeType length, bool copy = false) {
+        if (kSortKeys && sortDepth_ > 1) {
+            StrRef ref = RecordStrRef(str);
+            SortedEvent* e = PushSortEvent(SortedEvent::eKey);
+            e->strLen = length;
+            PushStrCopy(str, length, ref);
+            return true;
+        }
+        if (kSortKeys && sortDepth_ == 1) {
+            Level* level = level_stack_.template Top<Level>();
+            StrRef ref = RecordStrRef(str);
+            SortedKeyEntry* entry = sortBuf_.template Push<SortedKeyEntry>();
+            entry->keyLen = length;
+            entry->dataSize = 0;
+            level->sortedMemberCount++;
+            PushStrCopy(str, length, ref);
+            return true;
+        }
+        return String(str, length, copy);
+    }
 
 #if RAPIDJSON_HAS_STDSTRING
     bool Key(const std::basic_string<Ch>& str)
@@ -230,21 +309,44 @@ public:
 #endif
 
     bool EndObject(SizeType memberCount = 0) {
+        if (kSortKeys && sortDepth_ > 1) {
+            SortedEvent* e = PushSortEvent(SortedEvent::eEndObject);
+            e->uintVal = memberCount;
+            sortDepth_--;
+            if (sortDepth_ == 1) FinalizeSortedMember();
+            return true;
+        }
+        if (kSortKeys && sortDepth_ == 1) {
+            SortAndReplay(this, memberCount);
+            // Fall through to normal EndObject path
+        }
         (void)memberCount;
-        RAPIDJSON_ASSERT(level_stack_.GetSize() >= sizeof(Level)); // not inside an Object
-        RAPIDJSON_ASSERT(!level_stack_.template Top<Level>()->inArray); // currently inside an Array, not Object
-        RAPIDJSON_ASSERT(0 == level_stack_.template Top<Level>()->valueCount % 2); // Object has a Key without a Value
+        RAPIDJSON_ASSERT(level_stack_.GetSize() >= sizeof(Level));
+        RAPIDJSON_ASSERT(!level_stack_.template Top<Level>()->inArray);
+        RAPIDJSON_ASSERT(0 == level_stack_.template Top<Level>()->valueCount % 2);
         level_stack_.template Pop<Level>(1);
         return EndValue(WriteEndObject());
     }
 
     bool StartArray() {
+        if (kSortKeys && sortDepth_ > 0) {
+            PushSortEvent(SortedEvent::eStartArray);
+            sortDepth_++;
+            return true;
+        }
         Prefix(kArrayType);
         new (level_stack_.template Push<Level>()) Level(true);
         return WriteStartArray();
     }
 
     bool EndArray(SizeType elementCount = 0) {
+        if (kSortKeys && sortDepth_ > 1) {
+            SortedEvent* e = PushSortEvent(SortedEvent::eEndArray);
+            e->uintVal = elementCount;
+            sortDepth_--;
+            if (sortDepth_ == 1) FinalizeSortedMember();
+            return true;
+        }
         (void)elementCount;
         RAPIDJSON_ASSERT(level_stack_.GetSize() >= sizeof(Level));
         RAPIDJSON_ASSERT(level_stack_.template Top<Level>()->inArray);
@@ -289,10 +391,204 @@ public:
 protected:
     //! Information for each nested level
     struct Level {
-        Level(bool inArray_) : valueCount(0), inArray(inArray_) {}
-        size_t valueCount;  //!< number of values in this level
-        bool inArray;       //!< true if in array, otherwise in object
+        Level(bool inArray_) : valueCount(0), inArray(inArray_), sortBufBase(0), sortedMemberCount(0) {}
+        size_t valueCount;          //!< number of values in this level
+        bool inArray;               //!< true if in array, otherwise in object
+        size_t sortBufBase;         //!< base offset in sortBuf_ for this sorted object
+        SizeType sortedMemberCount; //!< number of members collected for sorting
     };
+
+    //! A buffered SAX event for sorted-key mode.
+    struct SortedEvent {
+        enum Type : unsigned char {
+            eNull, eBool, eInt, eUint, eInt64, eUint64, eDouble,
+            eString, eKey, eRawNumber,
+            eStartObject, eEndObject, eStartArray, eEndArray
+        };
+        Type type;
+        // Payload (unioned to save space).
+        // For eString/eKey/eRawNumber, strLen chars of Ch follow this struct in sortBuf_.
+        union {
+            bool boolVal;
+            int intVal;
+            unsigned uintVal;
+            int64_t int64Val;
+            uint64_t uint64Val;
+            double doubleVal;
+            SizeType strLen;
+        };
+    };
+
+    //! Descriptor for one object member in sorted-key mode.
+    //! keyLen chars of Ch are stored right after this struct in sortBuf_.
+    struct SortedKeyEntry {
+        SizeType keyLen;
+        size_t dataSize; //!< total bytes of event data (variable-size) following key chars
+    };
+
+    //! Helper for tracking a string pointer that may reside inside sortBuf_.
+    struct StrRef {
+        bool inBuf;
+        size_t off;
+    };
+
+    //! Record a string pointer's position relative to sortBuf_ BEFORE any Push.
+    StrRef RecordStrRef(const Ch* s) {
+        StrRef r;
+        const char* base = sortBuf_.template Bottom<char>();
+        const char* sp = reinterpret_cast<const char*>(s);
+        r.inBuf = (sortBuf_.GetSize() > 0 && sp >= base && sp < base + sortBuf_.GetSize());
+        r.off = r.inBuf ? static_cast<size_t>(sp - base) : 0;
+        return r;
+    }
+
+    //! Copy string chars onto sortBuf_, safe even if str pointed into sortBuf_ before a realloc.
+    void PushStrCopy(const Ch* str, SizeType length, const StrRef& ref) {
+        Ch* dst = sortBuf_.template Push<Ch>(length);
+        const Ch* src = ref.inBuf
+            ? reinterpret_cast<const Ch*>(sortBuf_.template Bottom<char>() + ref.off)
+            : str;
+        for (SizeType i = 0; i < length; ++i) dst[i] = src[i];
+    }
+
+    SortedEvent* PushSortEvent(typename SortedEvent::Type t) {
+        SortedEvent* e = sortBuf_.template Push<SortedEvent>();
+        e->type = t;
+        return e;
+    }
+
+    void FinalizeSortedMember() {
+        Level* level = level_stack_.template Top<Level>();
+        size_t base = level->sortBufBase;
+        size_t top = sortBuf_.GetSize();
+        size_t offset = base;
+        for (SizeType i = 0; i < level->sortedMemberCount; ++i) {
+            char* buf = sortBuf_.template Bottom<char>();
+            SortedKeyEntry* entry = reinterpret_cast<SortedKeyEntry*>(buf + offset);
+            size_t dataStart = offset + sizeof(SortedKeyEntry) + entry->keyLen * sizeof(Ch);
+            if (i + 1 == level->sortedMemberCount) {
+                entry->dataSize = top - dataStart;
+            } else {
+                offset = dataStart + entry->dataSize;
+            }
+        }
+    }
+
+    //! Sort buffered members and replay them in order through \c self.
+    /*! Does NOT pop the Level or write the closing '}' — the caller's
+        EndObject handles that so PrettyWriter formatting works correctly.
+    */
+    template<typename Derived>
+    void SortAndReplay(Derived* self, SizeType /*memberCount*/) {
+        Level* level = level_stack_.template Top<Level>();
+        SizeType count = level->sortedMemberCount;
+        size_t sortBase = level->sortBufBase;
+
+        sortDepth_ = 0;
+
+        if (count == 0) {
+            size_t popSz = sortBuf_.GetSize() - sortBase;
+            if (popSz > 0) sortBuf_.template Pop<char>(popSz);
+            return;
+        }
+
+        // Phase 1: Build offset index above existing data.
+        size_t indexBase = sortBuf_.GetSize();
+        size_t* entryOffsets = sortBuf_.template Push<size_t>(count);
+        {
+            size_t off = sortBase;
+            for (SizeType i = 0; i < count; ++i) {
+                entryOffsets[i] = off;
+                char* buf = sortBuf_.template Bottom<char>();
+                SortedKeyEntry* ent = reinterpret_cast<SortedKeyEntry*>(buf + off);
+                off += sizeof(SortedKeyEntry) + ent->keyLen * sizeof(Ch) + ent->dataSize;
+            }
+        }
+
+        // Phase 2: Insertion sort by key using BitwiseStrCmp (no STL).
+        for (SizeType i = 1; i < count; ++i) {
+            char* buf = sortBuf_.template Bottom<char>();
+            size_t* offs = reinterpret_cast<size_t*>(buf + indexBase);
+            size_t tempOff = offs[i];
+            SizeType j = i;
+            while (j > 0) {
+                buf = sortBuf_.template Bottom<char>();
+                offs = reinterpret_cast<size_t*>(buf + indexBase);
+                SortedKeyEntry* prev = reinterpret_cast<SortedKeyEntry*>(buf + offs[j - 1]);
+                SortedKeyEntry* cur  = reinterpret_cast<SortedKeyEntry*>(buf + tempOff);
+                const Ch* pk = reinterpret_cast<const Ch*>(buf + offs[j - 1] + sizeof(SortedKeyEntry));
+                const Ch* ck = reinterpret_cast<const Ch*>(buf + tempOff + sizeof(SortedKeyEntry));
+                if (internal::BitwiseStrCmp(pk, prev->keyLen, ck, cur->keyLen) > 0) {
+                    offs[j] = offs[j - 1];
+                    --j;
+                } else {
+                    break;
+                }
+            }
+            buf = sortBuf_.template Bottom<char>();
+            offs = reinterpret_cast<size_t*>(buf + indexBase);
+            offs[j] = tempOff;
+        }
+
+        // Phase 3: Replay events in sorted order.
+        for (SizeType i = 0; i < count; ++i) {
+            char* buf = sortBuf_.template Bottom<char>();
+            size_t* offs = reinterpret_cast<size_t*>(buf + indexBase);
+            size_t eOff = offs[i];
+
+            SortedKeyEntry ent = *reinterpret_cast<SortedKeyEntry*>(buf + eOff);
+            const Ch* keyStr = reinterpret_cast<const Ch*>(buf + eOff + sizeof(SortedKeyEntry));
+            self->Key(keyStr, ent.keyLen, false);
+
+            size_t evStart = eOff + sizeof(SortedKeyEntry) + ent.keyLen * sizeof(Ch);
+            size_t evEnd = evStart + ent.dataSize;
+            size_t pos = evStart;
+            while (pos < evEnd) {
+                buf = sortBuf_.template Bottom<char>();
+                SortedEvent ev = *reinterpret_cast<SortedEvent*>(buf + pos);
+                pos += sizeof(SortedEvent);
+                switch (ev.type) {
+                case SortedEvent::eNull:        self->Null(); break;
+                case SortedEvent::eBool:        self->Bool(ev.boolVal); break;
+                case SortedEvent::eInt:         self->Int(ev.intVal); break;
+                case SortedEvent::eUint:        self->Uint(ev.uintVal); break;
+                case SortedEvent::eInt64:       self->Int64(ev.int64Val); break;
+                case SortedEvent::eUint64:      self->Uint64(ev.uint64Val); break;
+                case SortedEvent::eDouble:      self->Double(ev.doubleVal); break;
+                case SortedEvent::eString: {
+                    buf = sortBuf_.template Bottom<char>();
+                    const Ch* sd = reinterpret_cast<const Ch*>(buf + pos);
+                    pos += ev.strLen * sizeof(Ch);
+                    self->String(sd, ev.strLen, false);
+                    break;
+                }
+                case SortedEvent::eKey: {
+                    buf = sortBuf_.template Bottom<char>();
+                    const Ch* sd = reinterpret_cast<const Ch*>(buf + pos);
+                    pos += ev.strLen * sizeof(Ch);
+                    self->Key(sd, ev.strLen, false);
+                    break;
+                }
+                case SortedEvent::eRawNumber: {
+                    buf = sortBuf_.template Bottom<char>();
+                    const Ch* sd = reinterpret_cast<const Ch*>(buf + pos);
+                    pos += ev.strLen * sizeof(Ch);
+                    self->RawNumber(sd, ev.strLen, false);
+                    break;
+                }
+                case SortedEvent::eStartObject: self->StartObject(); break;
+                case SortedEvent::eEndObject:   self->EndObject(ev.uintVal); break;
+                case SortedEvent::eStartArray:  self->StartArray(); break;
+                case SortedEvent::eEndArray:    self->EndArray(ev.uintVal); break;
+                default: break;
+                }
+            }
+        }
+
+        // Phase 4: Clean up sortBuf_.
+        size_t popSz = sortBuf_.GetSize() - sortBase;
+        if (popSz > 0) sortBuf_.template Pop<char>(popSz);
+    }
 
     bool WriteNull()  {
         PutReserve(*os_, 4);
@@ -507,6 +803,8 @@ protected:
     internal::Stack<StackAllocator> level_stack_;
     int maxDecimalPlaces_;
     bool hasRoot_;
+    internal::Stack<StackAllocator> sortBuf_;   //!< Buffer for sorted-key event data.
+    unsigned sortDepth_;                         //!< 0=normal; 1=capturing direct members; >1=nested
 
 private:
     // Prohibit copy constructor & assignment operator.
