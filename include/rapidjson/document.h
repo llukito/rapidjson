@@ -1806,6 +1806,73 @@ public:
         return pos;
     }
 
+    //! Rotate elements in the range [\c first, \c last) so that \c middle becomes the new first.
+    /*!
+        Same semantics as \c std::rotate: the range [\c first, \c last) is rotated left so
+        that the element at \c middle is first. Done in place with \ref Swap; no allocation.
+
+        \param first  Iterator to the first element of the range
+        \param middle Iterator to the element that should become first
+        \param last   Iterator past the last element of the range
+        \pre IsArray() == true && \ref Begin() <= \c first <= \c middle <= \c last <= \ref End()
+        \return Iterator to the new position of the element that was previously at \c first
+                (i.e. \c first + (\c last - \c middle)).
+        \note Linear time complexity.
+    */
+    ValueIterator Rotate(ConstValueIterator first, ConstValueIterator middle, ConstValueIterator last) {
+        RAPIDJSON_ASSERT(IsArray());
+        RAPIDJSON_ASSERT(first >= Begin());
+        RAPIDJSON_ASSERT(first <= middle);
+        RAPIDJSON_ASSERT(middle <= last);
+        RAPIDJSON_ASSERT(last <= End());
+        ValueIterator f = Begin() + (first - Begin());
+        ValueIterator m = Begin() + (middle - Begin());
+        ValueIterator l = Begin() + (last - Begin());
+        if (f == m || m == l)
+            return f + (l - m);
+        // Three-reverse in-place rotate (no allocation).
+        ReverseElements(f, m);
+        ReverseElements(m, l);
+        ReverseElements(f, l);
+        return f + (l - m);
+    }
+
+    //! Rotate the whole array left by \c offset positions.
+    /*!
+        Element formerly at index \c offset becomes the first element.
+        \param offset Positions to shift left; reduced modulo \ref Size().
+        \return The value itself for fluent API.
+        \pre IsArray() == true
+        \note Linear time complexity, no allocation.
+    */
+    GenericValue& RotateLeft(SizeType offset) {
+        RAPIDJSON_ASSERT(IsArray());
+        if (data_.a.size <= 1)
+            return *this;
+        offset %= data_.a.size;
+        if (offset != 0)
+            Rotate(Begin(), Begin() + offset, End());
+        return *this;
+    }
+
+    //! Rotate the whole array right by \c offset positions.
+    /*!
+        Element formerly at index \c Size()-offset becomes the first element.
+        \param offset Positions to shift right; reduced modulo \ref Size().
+        \return The value itself for fluent API.
+        \pre IsArray() == true
+        \note Linear time complexity, no allocation.
+    */
+    GenericValue& RotateRight(SizeType offset) {
+        RAPIDJSON_ASSERT(IsArray());
+        if (data_.a.size <= 1)
+            return *this;
+        offset %= data_.a.size;
+        if (offset != 0)
+            RotateLeft(data_.a.size - offset);
+        return *this;
+    }
+
     Array GetArray() { RAPIDJSON_ASSERT(IsArray()); return Array(*this); }
     ConstArray GetArray() const { RAPIDJSON_ASSERT(IsArray()); return ConstArray(*this); }
 
@@ -2456,6 +2523,17 @@ private:
         str[s.length] = '\0';
     }
 
+    //! Reverse [first, last) in place via Swap (no allocation). Avoids self-swap.
+    static void ReverseElements(ValueIterator first, ValueIterator last) {
+        while (first < last) {
+            --last;
+            if (first == last)
+                break;
+            first->Swap(*last);
+            ++first;
+        }
+    }
+
     //! Assignment without calling destructor
     void RawAssign(GenericValue& rhs) RAPIDJSON_NOEXCEPT {
         data_ = rhs.data_;
@@ -2932,6 +3010,9 @@ public:
     GenericArray PopBack() const { value_.PopBack(); return *this; }
     ValueIterator Erase(ConstValueIterator pos) const { return value_.Erase(pos); }
     ValueIterator Erase(ConstValueIterator first, ConstValueIterator last) const { return value_.Erase(first, last); }
+    ValueIterator Rotate(ConstValueIterator first, ConstValueIterator middle, ConstValueIterator last) const { return value_.Rotate(first, middle, last); }
+    GenericArray RotateLeft(SizeType offset) const { value_.RotateLeft(offset); return *this; }
+    GenericArray RotateRight(SizeType offset) const { value_.RotateRight(offset); return *this; }
 
 #if RAPIDJSON_HAS_CXX11_RANGE_FOR
     ValueIterator begin() const { return value_.Begin(); }
