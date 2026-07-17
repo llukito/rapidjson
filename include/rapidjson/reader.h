@@ -278,6 +278,62 @@ inline const char* SkipWhitespace(const char* p, const char* end) {
     return p;
 }
 
+//! Skip whitespace with SWAR, testing 8 characters at once via plain 64-bit word ops.
+/*! No SIMD intrinsics. Whitespace members (space, newline, CR, tab) are matched with
+    branch-free bitwise tests on each loaded 8-byte word; the scalar SkipWhitespace
+    handles any trailing run shorter than 8 bytes.
+*/
+inline const char *SkipWhitespace_SWAR(const char* p, const char* end) {
+    // 0x01 and 0x80 repeated in every byte lane
+    const uint64_t kOnes  = RAPIDJSON_UINT64_C2(0x01010101, 0x01010101);
+    const uint64_t kHighs = RAPIDJSON_UINT64_C2(0x80808080, 0x80808080);
+    // Broadcast each whitespace character across all 8 lanes
+    const uint64_t kSp = kOnes * static_cast<uint64_t>(' ');
+    const uint64_t kNl = kOnes * static_cast<uint64_t>('\n');
+    const uint64_t kCr = kOnes * static_cast<uint64_t>('\r');
+    const uint64_t kTb = kOnes * static_cast<uint64_t>('\t');
+
+    for (; static_cast<size_t>(end - p) >= 8; p += 8) {
+        uint64_t w;
+        std::memcpy(&w, p, sizeof(w));
+
+        // haszero(x ^ broadcast(c)): 0x80 in each lane equal to c (branch-free)
+        const uint64_t t0 = w ^ kSp;
+        const uint64_t t1 = w ^ kNl;
+        const uint64_t t2 = w ^ kCr;
+        const uint64_t t3 = w ^ kTb;
+        const uint64_t eq =
+            ((t0 - kOnes) & ~t0 & kHighs) |
+            ((t1 - kOnes) & ~t1 & kHighs) |
+            ((t2 - kOnes) & ~t2 & kHighs) |
+            ((t3 - kOnes) & ~t3 & kHighs);
+
+        // 0x80 where the byte is *not* whitespace
+        const uint64_t nonws = ~eq & kHighs;
+        if (nonws != 0) {
+            // Index of first non-whitespace byte in memory order.
+            // After memcpy, the first char is in the least-significant byte on
+            // little-endian hosts and the most-significant byte on big-endian.
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+            return p + (internal::clzll(nonws) >> 3);
+#else
+            // LE (and default): byte-swap so the first memory byte sits at the top,
+            // then count leading zeros with the existing helper (no ctz intrinsic).
+            uint64_t x = nonws;
+            x = ((x & RAPIDJSON_UINT64_C2(0x00000000, 0xFFFFFFFF)) << 32) |
+                ((x & RAPIDJSON_UINT64_C2(0xFFFFFFFF, 0x00000000)) >> 32);
+            x = ((x & RAPIDJSON_UINT64_C2(0x0000FFFF, 0x0000FFFF)) << 16) |
+                ((x & RAPIDJSON_UINT64_C2(0xFFFF0000, 0xFFFF0000)) >> 16);
+            x = ((x & RAPIDJSON_UINT64_C2(0x00FF00FF, 0x00FF00FF)) << 8) |
+                ((x & RAPIDJSON_UINT64_C2(0xFF00FF00, 0xFF00FF00)) >> 8);
+            return p + (internal::clzll(x) >> 3);
+#endif
+        }
+    }
+
+    return SkipWhitespace(p, end);
+}
+
 #ifdef RAPIDJSON_SSE42
 //! Skip whitespace with SSE 4.2 pcmpistrm instruction, testing 16 8-byte characters at once.
 inline const char *SkipWhitespace_SIMD(const char* p) {
