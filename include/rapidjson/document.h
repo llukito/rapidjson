@@ -1788,22 +1788,63 @@ public:
         \param first iterator to the first element to remove
         \param last  iterator following the last element to remove
         \pre IsArray() == true && \ref Begin() <= \c first <= \c last <= \ref End()
-        \return Iterator following the last removed element.
-        \note Linear time complexity.
+        \return Iterator following the last removed element. If the range is empty, returns
+                an iterator equivalent to \c first.
+        \note Linear time complexity. Empty range (including on an empty array) is a no-op.
     */
     ValueIterator Erase(ConstValueIterator first, ConstValueIterator last) {
         RAPIDJSON_ASSERT(IsArray());
-        RAPIDJSON_ASSERT(data_.a.size > 0);
-        RAPIDJSON_ASSERT(GetElementsPointer() != 0);
         RAPIDJSON_ASSERT(first >= Begin());
         RAPIDJSON_ASSERT(first <= last);
         RAPIDJSON_ASSERT(last <= End());
         ValueIterator pos = Begin() + (first - Begin());
+        if (first == last)
+            return pos;
+        RAPIDJSON_ASSERT(GetElementsPointer() != 0);
         for (ValueIterator itr = pos; itr != last; ++itr)
             itr->~GenericValue();
         std::memmove(static_cast<void*>(pos), last, static_cast<size_t>(End() - last) * sizeof(GenericValue));
         data_.a.size -= static_cast<SizeType>(last - first);
         return pos;
+    }
+
+    //! Remove duplicate elements from the array in place.
+    /*!
+        Compares elements with \ref operator==. For each distinct value, the first
+        occurrence is kept and later equal elements are removed. Relative order of
+        the kept elements is preserved.
+
+        \return The value itself for fluent API.
+        \pre IsArray() == true
+        \note Quadratic time complexity (equality comparisons). No heap allocation;
+              elements are rearranged with \ref Swap and destroyed like \ref Erase.
+    */
+    GenericValue& RemoveDuplicates() {
+        RAPIDJSON_ASSERT(IsArray());
+        if (data_.a.size <= 1)
+            return *this;
+
+        GenericValue* e = GetElementsPointer();
+        const SizeType n = data_.a.size;
+        SizeType w = 0; // write cursor: [0, w) are unique kept elements
+        for (SizeType r = 0; r < n; r++) {
+            bool duplicate = false;
+            for (SizeType j = 0; j < w; j++) {
+                if (e[j] == e[r]) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                if (w != r)
+                    e[w].Swap(e[r]);
+                ++w;
+            }
+        }
+        for (SizeType i = w; i < n; i++)
+            e[i].~GenericValue();
+        data_.a.size = w;
+        return *this;
     }
 
     //! Rotate elements in the range [\c first, \c last) so that \c middle becomes the new first.
@@ -3013,6 +3054,7 @@ public:
     ValueIterator Rotate(ConstValueIterator first, ConstValueIterator middle, ConstValueIterator last) const { return value_.Rotate(first, middle, last); }
     GenericArray RotateLeft(SizeType offset) const { value_.RotateLeft(offset); return *this; }
     GenericArray RotateRight(SizeType offset) const { value_.RotateRight(offset); return *this; }
+    GenericArray RemoveDuplicates() const { value_.RemoveDuplicates(); return *this; }
 
 #if RAPIDJSON_HAS_CXX11_RANGE_FOR
     ValueIterator begin() const { return value_.Begin(); }
