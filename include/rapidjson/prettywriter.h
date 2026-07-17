@@ -100,11 +100,12 @@ public:
     bool Uint64(uint64_t u64)   { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteUint64(u64));  }
     bool Double(double d)       { PrettyPrefix(kNumberType); return Base::EndValue(Base::WriteDouble(d)); }
 
+    //! Write a number from pre-formatted character text (no quotes). Matches Writer::RawNumber.
     bool RawNumber(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
         PrettyPrefix(kNumberType);
-        return Base::EndValue(Base::WriteString(str, length));
+        return Base::EndValue(Base::WriteRawValue(str, length));
     }
 
     bool String(const Ch* str, SizeType length, bool copy = false) {

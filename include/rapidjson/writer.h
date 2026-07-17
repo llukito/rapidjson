@@ -160,6 +160,9 @@ public:
     //! Sets the maximum number of decimal places for double output.
     /*!
         This setting truncates the output with specified number of decimal places.
+        It applies to \ref Double / \ref WriteDouble only. \ref RawNumber writes the
+        supplied digit text as-is (no re-rounding), so values that arrived via
+        \c kParseNumbersAsStringsFlag keep their original representation.
 
         For example, 
 
@@ -201,11 +204,16 @@ public:
     */
     bool Double(double d)       { Prefix(kNumberType); return EndValue(WriteDouble(d)); }
 
+    //! Write a number from pre-formatted character text (no quotes).
+    /*! Used as the Handler sink for \c kParseNumbersAsStringsFlag. Unlike \ref String,
+        the text is emitted as a JSON number via \ref WriteRawValue, so Reader→Writer
+        round-trips stay numeric. \ref maxDecimalPlaces_ is not applied (see SetMaxDecimalPlaces).
+    */
     bool RawNumber(const Ch* str, SizeType length, bool copy = false) {
         RAPIDJSON_ASSERT(str != 0);
         (void)copy;
         Prefix(kNumberType);
-        return EndValue(WriteString(str, length));
+        return EndValue(WriteRawValue(str, length));
     }
 
     bool String(const Ch* str, SizeType length, bool copy = false) {
