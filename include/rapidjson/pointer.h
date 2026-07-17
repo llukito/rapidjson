@@ -383,6 +383,33 @@ public:
     */
     bool operator!=(const GenericPointer& rhs) const { return !(*this == rhs); }
 
+    //! Check whether this pointer is a path prefix of \c rhs.
+    /*!
+        Token-for-token match on the shared leading path, using the same fields as
+        \ref operator== (index, length, name). Equal pointers are prefixes of each
+        other. The empty pointer is a prefix of every valid pointer.
+
+        Examples: \c /foo/bar is a prefix of \c /foo/bar/baz, but not of \c /foo/baz
+        or \c /foo.
+
+        \note When any pointer is invalid, always returns false.
+    */
+    bool IsPrefixOf(const GenericPointer& rhs) const {
+        if (!IsValid() || !rhs.IsValid() || tokenCount_ > rhs.tokenCount_)
+            return false;
+
+        for (size_t i = 0; i < tokenCount_; i++) {
+            if (tokens_[i].index != rhs.tokens_[i].index ||
+                tokens_[i].length != rhs.tokens_[i].length ||
+                (tokens_[i].length != 0 && std::memcmp(tokens_[i].name, rhs.tokens_[i].name, sizeof(Ch) * tokens_[i].length) != 0))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     //! Less than operator.
     /*!
         \note Invalid pointers are always greater than valid ones.
