@@ -352,6 +352,16 @@ public:
     //! Get the number of tokens.
     size_t GetTokenCount() const { return tokenCount_; }
 
+    //! Check whether this pointer refers to the document root (empty path).
+    /*!
+        True for a valid empty pointer (\c "" or \c "#"), which names the root value
+        itself rather than a nested member or element.
+
+        \note \ref Get on a root pointer returns the root value. \ref Erase on a root
+              pointer always fails (the root itself cannot be erased).
+    */
+    bool IsRoot() const { return IsValid() && tokenCount_ == 0; }
+
     //@}
 
     //!@name Equality/inequality operators
