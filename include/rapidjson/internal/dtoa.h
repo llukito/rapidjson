@@ -239,6 +239,395 @@ inline char* dtoa(double value, char* buffer, int maxDecimalPlaces = 324) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shortest round-trip double-to-string without Grisu tables or FP compares.
+// Digit generation is pure integer / bitwise arithmetic (Dragon4-style).
+// ---------------------------------------------------------------------------
+
+// Minimal multiprecision unsigned integer for ShortestDigitGen.
+// Capacity holds values up to roughly 2^1100 / 5^1100 intermediates.
+struct DtoaBigint {
+    static const int kCapacity = 40; // 40 * 32 = 1280 bits
+    uint32_t digits[kCapacity];
+    int count; // number of limbs in use; 0 means zero
+
+    void AssignU64(uint64_t v) {
+        if (v == 0) {
+            count = 0;
+            return;
+        }
+        digits[0] = static_cast<uint32_t>(v);
+        digits[1] = static_cast<uint32_t>(v >> 32);
+        count = digits[1] ? 2 : 1;
+    }
+
+    void AssignPow2(int exp) {
+        RAPIDJSON_ASSERT(exp >= 0);
+        const int limb = exp / 32;
+        const int bit = exp % 32;
+        RAPIDJSON_ASSERT(limb < kCapacity);
+        std::memset(digits, 0, static_cast<size_t>(limb + 1) * sizeof(uint32_t));
+        digits[limb] = uint32_t(1) << bit;
+        count = limb + 1;
+    }
+
+    bool IsZero() const { return count == 0; }
+
+    int Compare(const DtoaBigint& rhs) const {
+        if (count != rhs.count)
+            return count < rhs.count ? -1 : 1;
+        for (int i = count - 1; i >= 0; i--) {
+            if (digits[i] != rhs.digits[i])
+                return digits[i] < rhs.digits[i] ? -1 : 1;
+        }
+        return 0;
+    }
+
+    // *this += rhs; assumes no strong size constraints beyond capacity.
+    void Add(const DtoaBigint& rhs) {
+        uint64_t carry = 0;
+        const int n = count > rhs.count ? count : rhs.count;
+        for (int i = 0; i < n; i++) {
+            carry += (i < count ? digits[i] : 0);
+            carry += (i < rhs.count ? rhs.digits[i] : 0);
+            digits[i] = static_cast<uint32_t>(carry);
+            carry >>= 32;
+        }
+        count = n;
+        if (carry) {
+            RAPIDJSON_ASSERT(count < kCapacity);
+            digits[count++] = static_cast<uint32_t>(carry);
+        }
+        // Trim is unnecessary if carry/high limbs stay nonzero.
+    }
+
+    // *this -= rhs; requires *this >= rhs.
+    void Subtract(const DtoaBigint& rhs) {
+        RAPIDJSON_ASSERT(Compare(rhs) >= 0);
+        int64_t borrow = 0;
+        for (int i = 0; i < count; i++) {
+            int64_t diff = static_cast<int64_t>(digits[i]) - borrow
+                         - (i < rhs.count ? rhs.digits[i] : 0);
+            if (diff < 0) {
+                diff += (int64_t(1) << 32);
+                borrow = 1;
+            }
+            else
+                borrow = 0;
+            digits[i] = static_cast<uint32_t>(diff);
+        }
+        while (count > 0 && digits[count - 1] == 0)
+            count--;
+    }
+
+    void MultiplyByU32(uint32_t m) {
+        if (m == 0 || count == 0) {
+            count = 0;
+            return;
+        }
+        if (m == 1)
+            return;
+        uint64_t carry = 0;
+        for (int i = 0; i < count; i++) {
+            carry += static_cast<uint64_t>(digits[i]) * m;
+            digits[i] = static_cast<uint32_t>(carry);
+            carry >>= 32;
+        }
+        if (carry) {
+            RAPIDJSON_ASSERT(count < kCapacity);
+            digits[count++] = static_cast<uint32_t>(carry);
+        }
+    }
+
+    void ShiftLeft(int shift) {
+        if (count == 0 || shift == 0)
+            return;
+        const int limbShift = shift / 32;
+        const int bitShift = shift % 32;
+        RAPIDJSON_ASSERT(count + limbShift + (bitShift ? 1 : 0) <= kCapacity);
+
+        if (bitShift == 0) {
+            for (int i = count - 1; i >= 0; i--)
+                digits[i + limbShift] = digits[i];
+            std::memset(digits, 0, static_cast<size_t>(limbShift) * sizeof(uint32_t));
+            count += limbShift;
+            return;
+        }
+
+        // Clear destination high limbs so |= of shifted-in bits is correct.
+        std::memset(digits + count, 0, static_cast<size_t>(limbShift + 1) * sizeof(uint32_t));
+        for (int i = count - 1; i >= 0; i--) {
+            const uint64_t v = static_cast<uint64_t>(digits[i]) << bitShift;
+            digits[i + limbShift + 1] |= static_cast<uint32_t>(v >> 32);
+            digits[i + limbShift] = static_cast<uint32_t>(v);
+        }
+        std::memset(digits, 0, static_cast<size_t>(limbShift) * sizeof(uint32_t));
+        count += limbShift;
+        if (digits[count] != 0)
+            count++;
+    }
+
+    // Multiply by 5^exp (exp built from small powers only — not Grisu caches).
+    void MultiplyPow5(int exp) {
+        static const uint32_t kPow5[] = {
+            5u, 25u, 125u, 625u, 3125u, 15625u, 78125u, 390625u,
+            1953125u, 9765625u, 48828125u, 244140625u // 5^1 .. 5^12
+        };
+        while (exp >= 13) {
+            // 5^13 = 1220703125
+            MultiplyByU32(1220703125u);
+            exp -= 13;
+        }
+        if (exp > 0)
+            MultiplyByU32(kPow5[exp - 1]);
+    }
+
+    void MultiplyPow10(int exp) {
+        // 10^exp = 2^exp * 5^exp
+        MultiplyPow5(exp);
+        ShiftLeft(exp);
+    }
+
+    // Single decimal digit quotient: *this = *this % denom, return *this / denom.
+    // Requires 0 <= *this / denom <= 9 (as maintained by the digit loop).
+    uint32_t DivModTakeDigit(const DtoaBigint& denom) {
+        if (Compare(denom) < 0)
+            return 0;
+
+        // Binary search digit in [1, 9].
+        uint32_t low = 1, high = 9, result = 1;
+        DtoaBigint product;
+        while (low <= high) {
+            const uint32_t mid = (low + high) >> 1;
+            product = denom;
+            product.MultiplyByU32(mid);
+            const int cmp = Compare(product);
+            if (cmp >= 0) {
+                result = mid;
+                low = mid + 1;
+            }
+            else
+                high = mid - 1;
+        }
+        product = denom;
+        product.MultiplyByU32(result);
+        Subtract(product);
+        return result;
+    }
+};
+
+// Estimate floor(log10(2^e2 * f)) roughly; used only to pick a starting scale.
+// Pure integer: log10(2) ≈ 78913 / 2^18.
+inline int EstimateLog10Pow2(int e2) {
+    // Returns floor(e2 * log10(2)) for e2 in IEEE double range.
+    return static_cast<int>((static_cast<int64_t>(e2) * 78913LL) >> 18);
+}
+
+// Generate the shortest decimal digits of significand * 2^exponent that
+// round-trip to the same double. No floating-point ops in this routine.
+// On return, buffer[0..*length) holds digits and the value equals
+// (digit_integer) * 10^(*K).
+inline void ShortestDigitGen(uint64_t significand, int exponent, bool lowerBoundaryIsCloser,
+                             char* buffer, int* length, int* K) {
+    // half-ulp bounds as integers: value = significand * 2^exponent
+    // Work with 2x scale so midpoints are integral.
+    //   numerator / denominator == value
+    //   deltaMinus / denominator == value - lower
+    //   deltaPlus  / denominator == upper - value
+    DtoaBigint numerator, denominator, deltaMinus, deltaPlus;
+
+    numerator.AssignU64(significand);
+    if (exponent >= 0) {
+        numerator.ShiftLeft(exponent);
+        denominator.AssignU64(1);
+    }
+    else {
+        denominator.AssignPow2(-exponent);
+    }
+
+    // Scale by 2 so boundary midpoints are exact.
+    numerator.ShiftLeft(1);
+    denominator.ShiftLeft(1);
+
+    // Half ulp in this 2x scale is 2^exponent  (or 2^(exponent-1) if closer lower).
+    if (exponent >= 0) {
+        deltaPlus.AssignPow2(exponent);
+    }
+    else {
+        deltaPlus.AssignU64(1);
+        // denominator already has 2^(-exponent + 1); half-ulp = 2^(exponent-1) * 2
+        // = 2^exponent in absolute units. Relative to denom (= 2^(-e+1)):
+        // half-ulp / (1/2 for the *2 scale)... assign 1 for the common case.
+        // value = s * 2^e, scaled num = s*2, denom = 2^(-e+1)
+        // half ulp = 2^(e-1); as num-units: half_ulp * 2 / 2^e * denom_factor
+        // = 2^e / 2^e = 1. So delta = 1.
+    }
+    deltaMinus = deltaPlus;
+
+    if (lowerBoundaryIsCloser) {
+        // Lower bound is one quarter ulp away: double everything, then halve deltaMinus.
+        numerator.ShiftLeft(1);
+        denominator.ShiftLeft(1);
+        deltaPlus.ShiftLeft(1);
+        // deltaMinus stays (half of deltaPlus)
+    }
+
+    // even significand => ties round to this value (IEEE ties-to-even)
+    const bool even = (significand & 1u) == 0;
+
+    // Decimal exponent estimate: value ~= 10^kRest
+    // significand has up to 53 bits; use bit length for log2 estimate.
+    int bitLen = 0;
+    {
+        uint64_t t = significand;
+        while (t) {
+            bitLen++;
+            t >>= 1;
+        }
+    }
+    // log10(value) ≈ (exponent + bitLen - 1) * log10(2)
+    int kRest = EstimateLog10Pow2(exponent + bitLen - 1);
+    // We want 1 <= value / 10^kRest < 10; adjust via integer compares below.
+
+    // Scale so that numerator/denominator is in [1, 10).
+    // Multiply numerator by 10^(-kRest): if kRest >= 0, divide by 10^kRest
+    // (i.e. grow denominator); if kRest < 0, grow numerator by 10^(-kRest).
+    if (kRest >= 0) {
+        denominator.MultiplyPow10(kRest);
+    }
+    else {
+        numerator.MultiplyPow10(-kRest);
+        deltaMinus.MultiplyPow10(-kRest);
+        deltaPlus.MultiplyPow10(-kRest);
+    }
+
+    // Fix over/under estimate of kRest so that 1 <= num/den < 10.
+    // num/den >= 1  <=> num >= den
+    // num/den < 10 <=> num < 10*den
+    {
+        DtoaBigint tenDen = denominator;
+        tenDen.MultiplyByU32(10);
+        if (numerator.Compare(denominator) < 0) {
+            numerator.MultiplyByU32(10);
+            deltaMinus.MultiplyByU32(10);
+            deltaPlus.MultiplyByU32(10);
+            kRest--;
+        }
+        else if (numerator.Compare(tenDen) >= 0) {
+            denominator.MultiplyByU32(10);
+            kRest++;
+        }
+    }
+
+    // Digit generation: produce d0.d1d2... with no FP comparisons.
+    // low  = (num - deltaMinus) / den   (exclusive or inclusive via `even`)
+    // high = (num + deltaPlus)  / den
+    *length = 0;
+    for (;;) {
+        // digit = floor(num / den), num = num % den  (digit in 0..9)
+        const uint32_t digit = numerator.DivModTakeDigit(denominator);
+        buffer[(*length)++] = static_cast<char>('0' + static_cast<char>(digit));
+
+        // low_ok: remainder <= deltaMinus (or < if not even / open bound)
+        // high_ok: remainder + deltaPlus >= den (or > if open)
+        DtoaBigint restPlus = numerator;
+        restPlus.Add(deltaPlus);
+
+        const int cmpLow = numerator.Compare(deltaMinus);
+        const int cmpHigh = restPlus.Compare(denominator);
+
+        const bool low = even ? (cmpLow <= 0) : (cmpLow < 0);
+        const bool high = even ? (cmpHigh >= 0) : (cmpHigh > 0);
+
+        if (low || high) {
+            // Round: if only high, round up; if only low, keep; if both, tie to closer.
+            if (high && !low) {
+                // round up
+                int i = *length - 1;
+                for (;;) {
+                    if (buffer[i] < '9') {
+                        buffer[i]++;
+                        break;
+                    }
+                    buffer[i] = '0';
+                    if (i == 0) {
+                        buffer[0] = '1';
+                        kRest++;
+                        break;
+                    }
+                    i--;
+                }
+            }
+            else if (low && high) {
+                // Tie: round to even digit, or by comparing 2*rest with den.
+                // Compare distance: 2*num ? den  (closer to high if 2*num > den)
+                DtoaBigint twice = numerator;
+                twice.ShiftLeft(1);
+                const int cmpTie = twice.Compare(denominator);
+                if (cmpTie > 0 || (cmpTie == 0 && ((buffer[*length - 1] - '0') & 1))) {
+                    int i = *length - 1;
+                    for (;;) {
+                        if (buffer[i] < '9') {
+                            buffer[i]++;
+                            break;
+                        }
+                        buffer[i] = '0';
+                        if (i == 0) {
+                            buffer[0] = '1';
+                            kRest++;
+                            break;
+                        }
+                        i--;
+                    }
+                }
+            }
+            // else only low: leave digits as-is
+            break;
+        }
+
+        // Continue: num = num * 10, deltas * 10
+        numerator.MultiplyByU32(10);
+        deltaMinus.MultiplyByU32(10);
+        deltaPlus.MultiplyByU32(10);
+    }
+
+    // buffer = d0 d1 ... d_{n-1} represents digit_int * 10^(kRest - (n-1))
+    // dtoa/Prettify expects: value = digit_int * 10^K  with K = kRest - (length - 1)
+    *K = kRest - (*length - 1);
+
+    // Strip trailing zeros from the digit buffer; adjust K.
+    while (*length > 1 && buffer[*length - 1] == '0') {
+        (*length)--;
+        (*K)++;
+    }
+}
+
+// Shortest round-trip dtoa: no Grisu cached powers, integer digit generation only.
+inline char* shortdtoa(double value, char* buffer) {
+    Double d(value);
+    if (d.IsZero()) {
+        if (d.Sign())
+            *buffer++ = '-';
+        buffer[0] = '0';
+        buffer[1] = '.';
+        buffer[2] = '0';
+        return &buffer[3];
+    }
+
+    if (d.Sign())
+        *buffer++ = '-';
+
+    // Integer significand and binary exponent: value = significand * 2^exponent
+    const uint64_t significand = d.IntegerSignificand();
+    const int exponent = d.IntegerExponent();
+    // Lower boundary is closer iff the number is a power of two (normal).
+    const bool lowerBoundaryIsCloser = d.IsNormal() && d.Significand() == 0;
+
+    int length, K;
+    ShortestDigitGen(significand, exponent, lowerBoundaryIsCloser, buffer, &length, &K);
+    return Prettify(buffer, length, K, 324);
+}
+
 #ifdef __GNUC__
 RAPIDJSON_DIAG_POP
 #endif
