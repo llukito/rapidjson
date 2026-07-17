@@ -257,7 +257,7 @@ public:
         \return A new Pointer with appended token.
     */
     GenericPointer Append(const Ch* name, SizeType length, Allocator* allocator = 0) const {
-        Token token = { name, length, kPointerInvalidIndex };
+        Token token = { name, length, TokenIndexFromName(name, length) };
         return Append(token, allocator);
     }
 
@@ -919,6 +919,28 @@ private:
         return !((c >= '0' && c <= '9') || (c >= 'A' && c <='Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '.' || c == '_' || c =='~');
     }
 
+    //! Convert a token name to an array index, or kPointerInvalidIndex.
+    /*!
+        Matches the numeric-token rules used by Parse(): all digits, no leading
+        zero unless the name is exactly "0", and no SizeType overflow.
+    */
+    static SizeType TokenIndexFromName(const Ch* name, SizeType length) {
+        if (length == 0)
+            return kPointerInvalidIndex;
+        if (length > 1 && name[0] == '0')
+            return kPointerInvalidIndex;
+        SizeType n = 0;
+        for (SizeType j = 0; j < length; j++) {
+            if (name[j] < '0' || name[j] > '9')
+                return kPointerInvalidIndex;
+            const SizeType m = n * 10 + static_cast<SizeType>(name[j] - '0');
+            if (m < n) // overflow
+                return kPointerInvalidIndex;
+            n = m;
+        }
+        return n;
+    }
+
     //! Parse a JSON String or its URI fragment representation into tokens.
 #ifndef __clang__ // -Wdocumentation
     /*!
@@ -963,7 +985,6 @@ private:
             i++; // consumes '/'
 
             token->name = name;
-            bool isNumber = true;
 
             while (i < length && source[i] != '/') {
                 Ch c;
@@ -972,6 +993,8 @@ private:
                 // octets are decoded first so later steps (tilde escapes) see the
                 // same character stream as the plain JSON Pointer form.
                 if (uriFragment && source[i] == '%') {
+                    // Percent stream is a UTF-8 octet sequence (RFC 6901 §6).
+                    // Transcode one Unicode character into EncodingType code units.
                     PercentDecodeStream is(&source[i], source + length);
                     GenericInsituStringStream<EncodingType> os(name);
                     Ch* begin = os.PutBegin();
@@ -979,18 +1002,15 @@ private:
                         parseErrorCode_ = kPointerParseErrorInvalidPercentEncoding;
                         goto error;
                     }
-                    size_t len = os.PutEnd(begin);
+                    const size_t len = os.PutEnd(begin);
                     i += is.Tell();
                     if (len == 1) {
-                        // Single code unit (e.g. ASCII); re-process via tilde logic below.
-                        // The unit is already at *name from the stream write; we will
-                        // overwrite it when assigning *name++ = c after unescaping.
+                        // Single code unit — may still be '~' and need unescaping.
                         c = *name;
                     }
                     else {
-                        // Multi-unit UTF-8/transcoded sequence: already stored at name.
+                        // Multi-unit character already stored; not a tilde escape.
                         name += len;
-                        isNumber = false;
                         continue;
                     }
                 }
@@ -1004,8 +1024,8 @@ private:
                 }
 
                 // Escaping "~0" -> '~', "~1" -> '/' (RFC 6901).
-                // The escape selector is taken from the same decoded character stream,
-                // so both "~0" and "~%30" / "%7E%30" (URI form) resolve correctly.
+                // Escape selector comes from the same decoded stream, so "~0",
+                // "~%30", and "%7E%30" all resolve the same way.
                 if (c == '~') {
                     if (i >= length) {
                         parseErrorCode_ = kPointerParseErrorInvalidEscape;
@@ -1014,7 +1034,6 @@ private:
                     const size_t escapePos = i; // report errors at the selector position
                     Ch e;
                     if (uriFragment && source[i] == '%') {
-                        // Percent-encoded escape digit (e.g. %30 for '0', %31 for '1').
                         PercentDecodeStream is(&source[i], source + length);
                         e = is.Take();
                         if (!is.IsValid()) {
@@ -1042,35 +1061,11 @@ private:
                     }
                 }
 
-                // First check for index: all of characters are digit
-                if (c < '0' || c > '9')
-                    isNumber = false;
-
                 *name++ = c;
             }
             token->length = static_cast<SizeType>(name - token->name);
-            if (token->length == 0)
-                isNumber = false;
             *name++ = '\0'; // Null terminator
-
-            // Second check for index: more than one digit cannot have leading zero
-            if (isNumber && token->length > 1 && token->name[0] == '0')
-                isNumber = false;
-
-            // String to SizeType conversion
-            SizeType n = 0;
-            if (isNumber) {
-                for (size_t j = 0; j < token->length; j++) {
-                    SizeType m = n * 10 + static_cast<SizeType>(token->name[j] - '0');
-                    if (m < n) {   // overflow detection
-                        isNumber = false;
-                        break;
-                    }
-                    n = m;
-                }
-            }
-
-            token->index = isNumber ? n : kPointerInvalidIndex;
+            token->index = TokenIndexFromName(token->name, token->length);
             token++;
         }
 
@@ -1112,8 +1107,10 @@ private:
                     os.Put('~');
                     os.Put('1');
                 }
-                else if (uriFragment && NeedPercentEncode(c)) { 
-                    // Transcode to UTF8 sequence
+                else if (uriFragment && NeedPercentEncode(c)) {
+                    // Transcode one character to UTF-8 and percent-encode its octets.
+                    // Tilde and solidus are handled above so they stay as ~0 / ~1
+                    // (not %7E / %2F), which is required for parse round-trips.
                     GenericStringStream<typename ValueType::EncodingType> source(&t->name[j]);
                     PercentEncodeStream<OutputStream> target(os);
                     if (!Transcoder<EncodingType, UTF8<> >().Validate(source, target))
