@@ -342,16 +342,22 @@ struct UTF16 {
     static bool Decode(InputStream& is, unsigned* codepoint) {
         RAPIDJSON_STATIC_ASSERT(sizeof(typename InputStream::Ch) >= 2);
         typename InputStream::Ch c = is.Take();
-        if (c < 0xD800 || c > 0xDFFF) {
-            *codepoint = static_cast<unsigned>(c);
+        // Surrogates are 0xD800-0xDFFF <=> (cu & 0xF800) == 0xD800
+        const unsigned cu = static_cast<unsigned>(c);
+        if ((cu & 0xF800u) != 0xD800u) {
+            *codepoint = cu;
             return true;
         }
-        else if (c <= 0xDBFF) {
-            *codepoint = (static_cast<unsigned>(c) & 0x3FF) << 10;
+        // High surrogate 0xD800-0xDBFF <=> (cu & 0xFC00) == 0xD800
+        // Lone low surrogate 0xDC00-0xDFFF is rejected (do not return true).
+        if ((cu & 0xFC00u) == 0xD800u) {
+            *codepoint = (cu & 0x3FFu) << 10;
             c = is.Take();
-            *codepoint |= (static_cast<unsigned>(c) & 0x3FF);
+            const unsigned cl = static_cast<unsigned>(c);
+            *codepoint |= (cl & 0x3FFu);
             *codepoint += 0x10000;
-            return c >= 0xDC00 && c <= 0xDFFF;
+            // Low surrogate 0xDC00-0xDFFF <=> (cl & 0xFC00) == 0xDC00
+            return (cl & 0xFC00u) == 0xDC00u;
         }
         return false;
     }
@@ -362,11 +368,14 @@ struct UTF16 {
         RAPIDJSON_STATIC_ASSERT(sizeof(typename OutputStream::Ch) >= 2);
         typename InputStream::Ch c;
         os.Put(static_cast<typename OutputStream::Ch>(c = is.Take()));
-        if (c < 0xD800 || c > 0xDFFF)
+        // Same surrogate bit-mask tests as Decode (keep behavior in lockstep).
+        const unsigned cu = static_cast<unsigned>(c);
+        if ((cu & 0xF800u) != 0xD800u)
             return true;
-        else if (c <= 0xDBFF) {
+        // High surrogate only; lone low surrogate is invalid.
+        if ((cu & 0xFC00u) == 0xD800u) {
             os.Put(c = is.Take());
-            return c >= 0xDC00 && c <= 0xDFFF;
+            return (static_cast<unsigned>(c) & 0xFC00u) == 0xDC00u;
         }
         return false;
     }
