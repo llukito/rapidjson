@@ -94,6 +94,13 @@ public:
 
     static const int kDefaultMaxDecimalPlaces = 324;
 
+    //! Maximum characters written by internal::dtoa for any finite double (including sign).
+    /*! Empirically and by Prettify bounds the longest form is 25 characters, e.g.
+        \c -0.0000019073486328124998. One extra byte of capacity avoids exact-fill
+        buffer warnings from some compilers without changing output.
+    */
+    static const size_t kDoubleToStringBufferSize = 25 + 1;
+
     //! Constructor
     /*! \param os Output stream.
         \param stackAllocator User supplied allocator. If it is null, it will create a private one.
@@ -361,18 +368,18 @@ protected:
                 PutUnsafe(*os_, 'N'); PutUnsafe(*os_, 'a'); PutUnsafe(*os_, 'N');
                 return true;
             }
-            if (internal::Double(d).Sign()) {
-                PutReserve(*os_, 9);
+            // Infinity / -Infinity
+            static const char kInf[] = "Infinity";
+            const bool negative = internal::Double(d).Sign();
+            PutReserve(*os_, 8 + (negative ? 1u : 0u));
+            if (negative)
                 PutUnsafe(*os_, '-');
-            }
-            else
-                PutReserve(*os_, 8);
-            PutUnsafe(*os_, 'I'); PutUnsafe(*os_, 'n'); PutUnsafe(*os_, 'f');
-            PutUnsafe(*os_, 'i'); PutUnsafe(*os_, 'n'); PutUnsafe(*os_, 'i'); PutUnsafe(*os_, 't'); PutUnsafe(*os_, 'y');
+            for (const char* q = kInf; *q; ++q)
+                PutUnsafe(*os_, static_cast<typename OutputStream::Ch>(*q));
             return true;
         }
 
-        char buffer[25];
+        char buffer[kDoubleToStringBufferSize];
         char* end = internal::dtoa(d, buffer, maxDecimalPlaces_);
         PutReserve(*os_, static_cast<size_t>(end - buffer));
         for (char* p = buffer; p != end; ++p)
@@ -550,9 +557,11 @@ inline bool Writer<StringBuffer>::WriteUint64(uint64_t u) {
 
 template<>
 inline bool Writer<StringBuffer>::WriteDouble(double d) {
+    // Specialization for default writeFlags (== kWriteDefaultFlags). Keep the same
+    // flag checks as the primary WriteDouble so Nan/Inf-as-null works when set via
+    // RAPIDJSON_WRITE_DEFAULT_FLAGS.
     if (internal::Double(d).IsNanOrInf()) {
-        // Note: This code path can only be reached if (RAPIDJSON_WRITE_DEFAULT_FLAGS & kWriteNanAndInfFlag).
-        if (!(kWriteDefaultFlags & kWriteNanAndInfFlag))
+        if (!(kWriteDefaultFlags & kWriteNanAndInfFlag) && !(kWriteDefaultFlags & kWriteNanAndInfNullFlag))
             return false;
         if (kWriteDefaultFlags & kWriteNanAndInfNullFlag) {
             PutReserve(*os_, 4);
@@ -564,20 +573,19 @@ inline bool Writer<StringBuffer>::WriteDouble(double d) {
             PutUnsafe(*os_, 'N'); PutUnsafe(*os_, 'a'); PutUnsafe(*os_, 'N');
             return true;
         }
-        if (internal::Double(d).Sign()) {
-            PutReserve(*os_, 9);
+        static const char kInf[] = "Infinity";
+        const bool negative = internal::Double(d).Sign();
+        PutReserve(*os_, 8 + (negative ? 1u : 0u));
+        if (negative)
             PutUnsafe(*os_, '-');
-        }
-        else
-            PutReserve(*os_, 8);
-        PutUnsafe(*os_, 'I'); PutUnsafe(*os_, 'n'); PutUnsafe(*os_, 'f');
-        PutUnsafe(*os_, 'i'); PutUnsafe(*os_, 'n'); PutUnsafe(*os_, 'i'); PutUnsafe(*os_, 't'); PutUnsafe(*os_, 'y');
+        for (const char* q = kInf; *q; ++q)
+            PutUnsafe(*os_, *q);
         return true;
     }
-    
-    char *buffer = os_->Push(25);
+
+    char *buffer = os_->Push(kDoubleToStringBufferSize);
     char* end = internal::dtoa(d, buffer, maxDecimalPlaces_);
-    os_->Pop(static_cast<size_t>(25 - (end - buffer)));
+    os_->Pop(static_cast<size_t>(kDoubleToStringBufferSize - static_cast<size_t>(end - buffer)));
     return true;
 }
 
