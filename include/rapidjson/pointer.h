@@ -410,6 +410,31 @@ public:
         return false;
     }
 
+    //! Compute a hash code consistent with \ref operator==.
+    /*!
+        Equal pointers (by operator==) always produce the same hash, regardless of
+        whether they were parsed, appended, copied, or stringified and re-parsed.
+        \pre IsValid() == true
+        \note Uses the same FNV-1a mixing as the schema hasher.
+    */
+    uint64_t GetHashCode() const {
+        RAPIDJSON_ASSERT(IsValid());
+        // FNV-1a 64-bit offset basis
+        uint64_t h = RAPIDJSON_UINT64_C2(0xcbf29ce4, 0x84222325);
+        h = Hash(h, static_cast<uint64_t>(tokenCount_));
+        for (size_t i = 0; i < tokenCount_; i++) {
+            // Same fields as operator==: index, length, then name code units.
+            h = Hash(h, static_cast<uint64_t>(tokens_[i].index));
+            h = Hash(h, static_cast<uint64_t>(tokens_[i].length));
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(tokens_[i].name);
+            const size_t n = sizeof(Ch) * tokens_[i].length;
+            for (size_t j = 0; j < n; j++)
+                h = Hash(h, bytes[j]);
+        }
+        return h;
+    }
+
     //@}
 
     //!@name Stringify
@@ -460,42 +485,63 @@ public:
         ValueType* v = &root;
         bool exist = true;
         for (const Token *t = tokens_; t != tokens_ + tokenCount_; ++t) {
-            if (v->IsArray() && t->name[0] == '-' && t->length == 1) {
+            const bool isDash = (t->length == 1 && t->name[0] == Ch('-'));
+
+            // "-" appends only when the value is already an array. On null/scalar,
+            // "-" is a normal member name (see /foo/-/- → object key "-").
+            if (v->IsArray() && isDash) {
                 v->PushBack(ValueType().Move(), allocator);
                 v = &((*v)[v->Size() - 1]);
                 exist = false;
+                continue;
             }
-            else {
-                if (t->index == kPointerInvalidIndex) { // must be object name
-                    if (!v->IsObject())
-                        v->SetObject(); // Change to Object
-                }
-                else { // object name or array index
-                    if (!v->IsArray() && !v->IsObject())
-                        v->SetArray(); // Change to Array
-                }
 
-                if (v->IsArray()) {
-                    if (t->index >= v->Size()) {
-                        v->Reserve(t->index + 1, allocator);
-                        while (t->index >= v->Size())
-                            v->PushBack(ValueType().Move(), allocator);
-                        exist = false;
-                    }
-                    v = &((*v)[t->index]);
-                }
-                else {
-                    typename ValueType::MemberIterator m = v->FindMember(GenericValue<EncodingType>(GenericStringRef<Ch>(t->name, t->length)));
-                    if (m == v->MemberEnd()) {
-                        v->AddMember(ValueType(t->name, t->length, allocator).Move(), ValueType().Move(), allocator);
-                        m = v->MemberEnd();
-                        v = &(--m)->value; // Assumes AddMember() appends at the end
-                        exist = false;
-                    }
-                    else
-                        v = &m->value;
-                }
+            // Only retarget null / bool / number / string.
+            if (!v->IsObject() && !v->IsArray()) {
+                if (t->index != kPointerInvalidIndex)
+                    v->SetArray();
+                else
+                    v->SetObject();
+                exist = false;
             }
+
+            // Array index: prefer token.index; recover from a numeric name when the
+            // index field was left unset (e.g. static NAME("0")). Restored guard:
+            // do not treat a valid numeric token as an object key on an array (that
+            // used to SetObject and discard elements when the next token "wasn't"
+            // considered a valid index solely because token.index was unset).
+            SizeType index = t->index;
+            if (v->IsArray() && index == kPointerInvalidIndex)
+                index = TokenIndexFromName(t->name, t->length);
+
+            if (v->IsArray() && index != kPointerInvalidIndex) {
+                if (index >= v->Size()) {
+                    v->Reserve(index + 1, allocator);
+                    while (index >= v->Size())
+                        v->PushBack(ValueType().Move(), allocator);
+                    exist = false;
+                }
+                v = &((*v)[index]);
+                continue;
+            }
+
+            // Object member path. Array + non-index name becomes an object so Create
+            // can add a named child (Pointer.Ambiguity). Numeric tokens on arrays do
+            // not reach here after recovery above.
+            if (!v->IsObject()) {
+                v->SetObject();
+                exist = false;
+            }
+
+            typename ValueType::MemberIterator m = v->FindMember(GenericValue<EncodingType>(GenericStringRef<Ch>(t->name, t->length)));
+            if (m == v->MemberEnd()) {
+                v->AddMember(ValueType(t->name, t->length, allocator).Move(), ValueType().Move(), allocator);
+                m = v->MemberEnd();
+                v = &(--m)->value; // Assumes AddMember() appends at the end
+                exist = false;
+            }
+            else
+                v = &m->value;
         }
 
         if (alreadyExist)
@@ -939,6 +985,14 @@ private:
             n = m;
         }
         return n;
+    }
+
+    //! FNV-1a mix (same as internal schema Hasher).
+    static uint64_t Hash(uint64_t h, uint64_t d) {
+        static const uint64_t kPrime = RAPIDJSON_UINT64_C2(0x00000100, 0x000001b3);
+        h ^= d;
+        h *= kPrime;
+        return h;
     }
 
     //! Parse a JSON String or its URI fragment representation into tokens.
