@@ -966,50 +966,78 @@ private:
             bool isNumber = true;
 
             while (i < length && source[i] != '/') {
-                Ch c = source[i];
-                if (uriFragment) {
-                    // Decoding percent-encoding for URI fragment
-                    if (c == '%') {
-                        PercentDecodeStream is(&source[i], source + length);
-                        GenericInsituStringStream<EncodingType> os(name);
-                        Ch* begin = os.PutBegin();
-                        if (!Transcoder<UTF8<>, EncodingType>().Validate(is, os) || !is.IsValid()) {
-                            parseErrorCode_ = kPointerParseErrorInvalidPercentEncoding;
-                            goto error;
-                        }
-                        size_t len = os.PutEnd(begin);
-                        i += is.Tell() - 1;
-                        if (len == 1)
-                            c = *name;
-                        else {
-                            name += len;
-                            isNumber = false;
-                            i++;
-                            continue;
-                        }
+                Ch c;
+
+                // Decode the next character. In URI-fragment form, percent-encoded
+                // octets are decoded first so later steps (tilde escapes) see the
+                // same character stream as the plain JSON Pointer form.
+                if (uriFragment && source[i] == '%') {
+                    PercentDecodeStream is(&source[i], source + length);
+                    GenericInsituStringStream<EncodingType> os(name);
+                    Ch* begin = os.PutBegin();
+                    if (!Transcoder<UTF8<>, EncodingType>().Validate(is, os) || !is.IsValid()) {
+                        parseErrorCode_ = kPointerParseErrorInvalidPercentEncoding;
+                        goto error;
                     }
-                    else if (NeedPercentEncode(c)) {
+                    size_t len = os.PutEnd(begin);
+                    i += is.Tell();
+                    if (len == 1) {
+                        // Single code unit (e.g. ASCII); re-process via tilde logic below.
+                        // The unit is already at *name from the stream write; we will
+                        // overwrite it when assigning *name++ = c after unescaping.
+                        c = *name;
+                    }
+                    else {
+                        // Multi-unit UTF-8/transcoded sequence: already stored at name.
+                        name += len;
+                        isNumber = false;
+                        continue;
+                    }
+                }
+                else {
+                    c = source[i];
+                    if (uriFragment && NeedPercentEncode(c)) {
                         parseErrorCode_ = kPointerParseErrorCharacterMustPercentEncode;
                         goto error;
                     }
+                    i++;
                 }
 
-                i++;
-
-                // Escaping "~0" -> '~', "~1" -> '/'
+                // Escaping "~0" -> '~', "~1" -> '/' (RFC 6901).
+                // The escape selector is taken from the same decoded character stream,
+                // so both "~0" and "~%30" / "%7E%30" (URI form) resolve correctly.
                 if (c == '~') {
-                    if (i < length) {
-                        c = source[i];
-                        if (c == '0')       c = '~';
-                        else if (c == '1')  c = '/';
-                        else {
-                            parseErrorCode_ = kPointerParseErrorInvalidEscape;
+                    if (i >= length) {
+                        parseErrorCode_ = kPointerParseErrorInvalidEscape;
+                        goto error;
+                    }
+                    const size_t escapePos = i; // report errors at the selector position
+                    Ch e;
+                    if (uriFragment && source[i] == '%') {
+                        // Percent-encoded escape digit (e.g. %30 for '0', %31 for '1').
+                        PercentDecodeStream is(&source[i], source + length);
+                        e = is.Take();
+                        if (!is.IsValid()) {
+                            parseErrorCode_ = kPointerParseErrorInvalidPercentEncoding;
+                            goto error;
+                        }
+                        i += is.Tell();
+                    }
+                    else {
+                        e = source[i];
+                        if (uriFragment && NeedPercentEncode(e)) {
+                            parseErrorCode_ = kPointerParseErrorCharacterMustPercentEncode;
                             goto error;
                         }
                         i++;
                     }
+                    if (e == '0')
+                        c = '~';
+                    else if (e == '1')
+                        c = '/';
                     else {
                         parseErrorCode_ = kPointerParseErrorInvalidEscape;
+                        i = escapePos;
                         goto error;
                     }
                 }
