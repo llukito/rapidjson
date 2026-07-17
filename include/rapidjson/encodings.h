@@ -204,19 +204,54 @@ struct UTF8 {
     static unsigned char GetRange(unsigned char c) {
         // Referring to DFA of http://bjoern.hoehrmann.de/utf-8/decoder/dfa/
         // With new mapping 1 -> 0x10, 7 -> 0x20, 9 -> 0x40, such that AND operation can test multiple types.
-        static const unsigned char type[] = {
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-            0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,0x10,
-            0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,0x40,
-            0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
-            0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,0x20,
-            8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-            10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
-        };
-        return type[c];
+        // Same classification as the former type[] table, computed from the byte with
+        // only bitwise / arithmetic operations (no lookup table).
+        //   00..7F -> 0
+        //   80..8F -> 0x10,  90..9F -> 0x40,  A0..BF -> 0x20
+        //   C0..C1 -> 8,     C2..DF -> 2
+        //   E0 -> 10,  E1..EC -> 3,  ED -> 4,  EE..EF -> 3
+        //   F0 -> 11,  F1..F3 -> 6,  F4 -> 5,  F5..FF -> 8
+        const unsigned x = c;
+
+        // ASCII
+        if ((x & 0x80u) == 0)
+            return 0;
+
+        // Continuation bytes 0x80-0xBF
+        // 80..8F: 0x10, 90..9F: 0x40, A0..BF: 0x20  (from bits 4 and 5 of c)
+        if (x < 0xC0u) {
+            const unsigned b5 = (x >> 5) & 1u; // A0-BF
+            const unsigned b4 = (x >> 4) & 1u; // 90-9F (and B0-BF, masked out by b5)
+            return static_cast<unsigned char>(
+                0x20u * b5 + 0x40u * ((1u - b5) & b4) + 0x10u * ((1u - b5) & (1u - b4)));
+        }
+
+        // 2-byte lead: C0..C1 invalid (8), C2..DF type 2
+        if (x < 0xE0u)
+            return static_cast<unsigned char>(2u + 6u * (x < 0xC2u)); // 2 or 8
+
+        // 3-byte lead: E0 and ED differ from the rest of the row
+        if (x < 0xF0u) {
+            // E0 -> 10, ED -> 4, else 3
+            const unsigned isE0 = (x == 0xE0u); // 1 or 0
+            const unsigned isED = (x == 0xEDu);
+            // 3 + 7*isE0 + 1*isED  => E0:10, ED:4, else:3
+            return static_cast<unsigned char>(3u + 7u * isE0 + isED);
+        }
+
+        // 4-byte lead: F0..FF
+        // F0 -> 11, F1..F3 -> 6, F4 -> 5, F5..FF -> 8
+        {
+            const unsigned low = x & 0xFu;
+            const unsigned isF0 = (low == 0u);
+            const unsigned isF1F3 = ((low - 1u) < 3u); // low in 1..3
+            const unsigned isF4 = (low == 4u);
+            // Prefer mutually exclusive branches expressed arithmetically:
+            // isF0*11 + isF1F3*6 + isF4*5 + (!any)*8
+            const unsigned any = isF0 | isF1F3 | isF4;
+            return static_cast<unsigned char>(
+                11u * isF0 + 6u * isF1F3 + 5u * isF4 + 8u * (1u - any));
+        }
     }
 
     template <typename InputByteStream>
