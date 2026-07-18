@@ -319,6 +319,10 @@ public:
     virtual void Disallowed() = 0;
     virtual void DisallowedWhenWriting() = 0;
     virtual void DisallowedWhenReading() = 0;
+    //! 'then' failed after 'if' matched (draft-07 if/then/else).
+    virtual void NotThen(ISchemaValidator* thenValidator) = 0;
+    //! 'else' failed after 'if' did not match (draft-07 if/then/else).
+    virtual void NotElse(ISchemaValidator* elseValidator) = 0;
 };
 
 
@@ -539,9 +543,15 @@ public:
         enum_(),
         enumCount_(),
         not_(),
+        if_(),
+        then_(),
+        else_(),
         type_((1 << kTotalSchemaType) - 1), // typeless
         validatorCount_(),
         notValidatorIndex_(),
+        ifValidatorIndex_(),
+        thenValidatorIndex_(),
+        elseValidatorIndex_(),
         properties_(),
         additionalPropertiesSchema_(),
         patternProperties_(),
@@ -638,6 +648,24 @@ public:
                 schemaDocument->CreateSchema(&not_, p.Append(GetNotString(), allocator_), *v, document, id_);
                 notValidatorIndex_ = validatorCount_;
                 validatorCount_++;
+            }
+
+            // if/then/else (draft-07). then/else apply only when if is present.
+            if (const ValueType* ifV = GetMember(value, GetIfString())) {
+                const ValueType* thenV = GetMember(value, GetThenString());
+                const ValueType* elseV = GetMember(value, GetElseString());
+                if (thenV || elseV) {
+                    schemaDocument->CreateSchema(&if_, p.Append(GetIfString(), allocator_), *ifV, document, id_);
+                    ifValidatorIndex_ = validatorCount_++;
+                    if (thenV) {
+                        schemaDocument->CreateSchema(&then_, p.Append(GetThenString(), allocator_), *thenV, document, id_);
+                        thenValidatorIndex_ = validatorCount_++;
+                    }
+                    if (elseV) {
+                        schemaDocument->CreateSchema(&else_, p.Append(GetElseString(), allocator_), *elseV, document, id_);
+                        elseValidatorIndex_ = validatorCount_++;
+                    }
+                }
             }
         }
 
@@ -982,6 +1010,23 @@ public:
                 context.error_handler.Disallowed();
                 RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorNot);
             }
+
+            // if/then/else: if valid → then must hold (when present); if invalid → else must hold (when present).
+            if (if_) {
+                const bool ifMatched = context.validators[ifValidatorIndex_]->IsValid();
+                if (ifMatched) {
+                    if (then_ && !context.validators[thenValidatorIndex_]->IsValid()) {
+                        context.error_handler.NotThen(context.validators[thenValidatorIndex_]);
+                        RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorThen);
+                    }
+                }
+                else {
+                    if (else_ && !context.validators[elseValidatorIndex_]->IsValid()) {
+                        context.error_handler.NotElse(context.validators[elseValidatorIndex_]);
+                        RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorElse);
+                    }
+                }
+            }
         }
 
         return true;
@@ -1268,6 +1313,9 @@ public:
             case kValidateErrorReadOnly:                return GetReadOnlyString();
             case kValidateErrorWriteOnly:               return GetWriteOnlyString();
 
+            case kValidateErrorThen:                    return GetThenString();
+            case kValidateErrorElse:                    return GetElseString();
+
             default:                                    return GetNullString();
         }
     }
@@ -1294,6 +1342,9 @@ public:
     RAPIDJSON_STRING_(AnyOf, 'a', 'n', 'y', 'O', 'f')
     RAPIDJSON_STRING_(OneOf, 'o', 'n', 'e', 'O', 'f')
     RAPIDJSON_STRING_(Not, 'n', 'o', 't')
+    RAPIDJSON_STRING_(If, 'i', 'f')
+    RAPIDJSON_STRING_(Then, 't', 'h', 'e', 'n')
+    RAPIDJSON_STRING_(Else, 'e', 'l', 's', 'e')
     RAPIDJSON_STRING_(Properties, 'p', 'r', 'o', 'p', 'e', 'r', 't', 'i', 'e', 's')
     RAPIDJSON_STRING_(Required, 'r', 'e', 'q', 'u', 'i', 'r', 'e', 'd')
     RAPIDJSON_STRING_(Dependencies, 'd', 'e', 'p', 'e', 'n', 'd', 'e', 'n', 'c', 'i', 'e', 's')
@@ -1454,7 +1505,7 @@ private:
         else if (type == GetNumberString() ) type_ |= (1 << kNumberSchemaType) | (1 << kIntegerSchemaType);
     }
 
-    // Creates parallel validators for allOf, anyOf, oneOf, not and schema dependencies, if required.
+    // Creates parallel validators for allOf, anyOf, oneOf, not, if/then/else and schema dependencies, if required.
     // Also creates a hasher for enums and array uniqueness, if required.
     // Also a useful place to add type-independent error checks.
     bool CreateParallelValidator(Context& context) const {
@@ -1479,6 +1530,14 @@ private:
 
             if (not_)
                 context.validators[notValidatorIndex_] = context.factory.CreateSchemaValidator(*not_, false);
+
+            if (if_) {
+                context.validators[ifValidatorIndex_] = context.factory.CreateSchemaValidator(*if_, false);
+                if (then_)
+                    context.validators[thenValidatorIndex_] = context.factory.CreateSchemaValidator(*then_, false);
+                if (else_)
+                    context.validators[elseValidatorIndex_] = context.factory.CreateSchemaValidator(*else_, false);
+            }
 
             if (hasSchemaDependencies_) {
                 for (SizeType i = 0; i < propertyCount_; i++)
@@ -1704,9 +1763,15 @@ private:
     SchemaArray anyOf_;
     SchemaArray oneOf_;
     const SchemaType* not_;
+    const SchemaType* if_;
+    const SchemaType* then_;
+    const SchemaType* else_;
     unsigned type_; // bitmask of kSchemaType
     SizeType validatorCount_;
     SizeType notValidatorIndex_;
+    SizeType ifValidatorIndex_;
+    SizeType thenValidatorIndex_;
+    SizeType elseValidatorIndex_;
 
     Property* properties_;
     const SchemaType* additionalPropertiesSchema_;
@@ -2773,6 +2838,12 @@ public:
     void DisallowedWhenReading() {
         currentError_.SetObject();
         AddCurrentError(kValidateErrorWriteOnly);
+    }
+    void NotThen(ISchemaValidator* thenValidator) {
+        AddErrorArray(kValidateErrorThen, &thenValidator, 1);
+    }
+    void NotElse(ISchemaValidator* elseValidator) {
+        AddErrorArray(kValidateErrorElse, &elseValidator, 1);
     }
 
 #define RAPIDJSON_STRING_(name, ...) \

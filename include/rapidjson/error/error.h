@@ -195,7 +195,10 @@ enum ValidateErrorCode {
     kValidateErrorNot,                         //!< Property matched the sub-schema specified by 'not'.
 
     kValidateErrorReadOnly,                    //!< Property is read-only but has been provided when validation is for writing
-    kValidateErrorWriteOnly                    //!< Property is write-only but has been provided when validation is for reading
+    kValidateErrorWriteOnly,                   //!< Property is write-only but has been provided when validation is for reading
+
+    kValidateErrorThen,                        //!< Property did not match the sub-schema specified by 'then' after matching 'if'.
+    kValidateErrorElse                         //!< Property did not match the sub-schema specified by 'else' after not matching 'if'.
 };
 
 //! Function pointer type of GetValidateError().

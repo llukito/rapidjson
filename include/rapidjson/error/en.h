@@ -112,6 +112,9 @@ inline const RAPIDJSON_ERROR_CHARTYPE* GetValidateError_En(ValidateErrorCode val
         case kValidateErrorReadOnly:                    return RAPIDJSON_ERROR_STRING("Property is read-only but has been provided when validation is for writing.");
         case kValidateErrorWriteOnly:                   return RAPIDJSON_ERROR_STRING("Property is write-only but has been provided when validation is for reading.");
 
+        case kValidateErrorThen:                        return RAPIDJSON_ERROR_STRING("Property did not match the sub-schema specified by 'then' after matching 'if'.");
+        case kValidateErrorElse:                        return RAPIDJSON_ERROR_STRING("Property did not match the sub-schema specified by 'else' after not matching 'if'.");
+
         default:                                        return RAPIDJSON_ERROR_STRING("Unknown error.");
     }
 }
