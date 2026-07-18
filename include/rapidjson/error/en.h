@@ -119,6 +119,8 @@ inline const RAPIDJSON_ERROR_CHARTYPE* GetValidateError_En(ValidateErrorCode val
 
         case kValidateErrorPropertyNames:               return RAPIDJSON_ERROR_STRING("Object has a property name that does not match the 'propertyNames' sub-schema.");
 
+        case kValidateErrorConst:                       return RAPIDJSON_ERROR_STRING("Property has a value that does not match the 'const' value.");
+
         default:                                        return RAPIDJSON_ERROR_STRING("Unknown error.");
     }
 }

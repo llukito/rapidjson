@@ -275,6 +275,56 @@ TEST(SchemaValidator, Enum_InvalidType) {
         "}}");
 }
 
+TEST(SchemaValidator, Const) {
+    Document sd;
+    sd.Parse("{ \"const\": 1 }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "1", true);
+    VALIDATE(s, "1.0", true); // same number hash as enum
+    INVALIDATE(s, "2", "", "const", "",
+        "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
+    INVALIDATE(s, "\"1\"", "", "const", "",
+        "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
+}
+
+TEST(SchemaValidator, Const_String) {
+    Document sd;
+    sd.Parse("{ \"const\": \"hello\" }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "\"hello\"", true);
+    INVALIDATE(s, "\"world\"", "", "const", "",
+        "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
+}
+
+TEST(SchemaValidator, Const_Object) {
+    Document sd;
+    sd.Parse("{ \"const\": { \"a\": 1, \"b\": true } }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "{ \"a\": 1, \"b\": true }", true);
+    VALIDATE(s, "{ \"b\": true, \"a\": 1 }", true); // object key order independent (hasher)
+    INVALIDATE(s, "{ \"a\": 1 }", "", "const", "",
+        "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
+}
+
+TEST(SchemaValidator, Const_WithType) {
+    Document sd;
+    sd.Parse("{ \"type\": \"string\", \"const\": \"ok\" }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "\"ok\"", true);
+    INVALIDATE(s, "42", "", "type", "",
+        "{ \"type\": {"
+        "    \"errorCode\": 20,"
+        "    \"instanceRef\": \"#\", \"schemaRef\": \"#\","
+        "    \"expected\": [\"string\"], \"actual\": \"integer\""
+        "}}");
+    INVALIDATE(s, "\"no\"", "", "const", "",
+        "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
+}
+
 TEST(SchemaValidator, AllOf) {
     {
         Document sd;

@@ -319,13 +319,13 @@ public:
     virtual void Disallowed() = 0;
     virtual void DisallowedWhenWriting() = 0;
     virtual void DisallowedWhenReading() = 0;
-    //! 'then' failed after 'if' matched (draft-07 if/then/else).
+    //! then failed after if matched.
     virtual void NotThen(ISchemaValidator* thenValidator) = 0;
-    //! 'else' failed after 'if' did not match (draft-07 if/then/else).
+    //! else failed after if did not match.
     virtual void NotElse(ISchemaValidator* elseValidator) = 0;
-    //! Array has no element matching 'contains'.
+    //! Array has no element matching contains.
     virtual void NotContains() = 0;
-    //! Property name failed the 'propertyNames' sub-schema.
+    //! Property name failed the propertyNames subschema.
     virtual void NotPropertyNames(const Ch* name, SizeType length, ISchemaValidator* subvalidator) = 0;
 };
 
@@ -463,9 +463,10 @@ struct SchemaValidationContext {
         patternPropertiesSchemas(),
         patternPropertiesSchemaCount(),
         valuePatternValidatorType(kPatternValidatorOnly),
-        propertyExist(),
+        objectPatternValidatorType(kPatternValidatorOnly),
         containsValidator(),
         arrayElementIndex(),
+        propertyExist(),
         inArray(false),
         valueUniqueness(false),
         arrayUniqueness(false),
@@ -553,6 +554,11 @@ public:
         typeless_(schemaDocument->GetTypeless()),
         enum_(),
         enumCount_(),
+        constHash_(),
+        hasConst_(),
+        allOf_(),
+        anyOf_(),
+        oneOf_(),
         not_(),
         if_(),
         then_(),
@@ -639,31 +645,44 @@ public:
             if (v->IsArray() && v->Size() > 0) {
                 enum_ = static_cast<uint64_t*>(allocator_->Malloc(sizeof(uint64_t) * v->Size()));
                 for (ConstValueIterator itr = v->Begin(); itr != v->End(); ++itr) {
-                    typedef Hasher<EncodingType, MemoryPoolAllocator<AllocatorType> > EnumHasherType;
+                    typedef Hasher<EncodingType, MemoryPoolAllocator<AllocatorType> > ValueHasherType;
                     char buffer[256u + 24];
                     MemoryPoolAllocator<AllocatorType> hasherAllocator(buffer, sizeof(buffer));
-                    EnumHasherType h(&hasherAllocator, 256);
+                    ValueHasherType h(&hasherAllocator, 256);
                     itr->Accept(h);
                     enum_[enumCount_++] = h.GetHashCode();
                 }
             }
         }
 
+        // const (draft-06+): single allowed value, same hash comparison as enum.
+        // Not in OpenAPI 2.0 / 3.0.
+        if (spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
+            if (const ValueType* v = GetMember(value, GetConstString())) {
+                typedef Hasher<EncodingType, MemoryPoolAllocator<AllocatorType> > ValueHasherType;
+                char buffer[256u + 24];
+                MemoryPoolAllocator<AllocatorType> hasherAllocator(buffer, sizeof(buffer));
+                ValueHasherType h(&hasherAllocator, 256);
+                v->Accept(h);
+                constHash_ = h.GetHashCode();
+                hasConst_ = true;
+            }
+        }
+
         if (schemaDocument)
             AssignIfExist(allOf_, *schemaDocument, p, value, GetAllOfString(), document);
 
-        // AnyOf, OneOf, Not not supported for open api 2.0
+        // anyOf, oneOf, not: not supported for OpenAPI 2.0
         if (schemaDocument && spec_.oapi != kVersion20) {
             AssignIfExist(anyOf_, *schemaDocument, p, value, GetAnyOfString(), document);
             AssignIfExist(oneOf_, *schemaDocument, p, value, GetOneOfString(), document);
 
             if (const ValueType* v = GetMember(value, GetNotString())) {
                 schemaDocument->CreateSchema(&not_, p.Append(GetNotString(), allocator_), *v, document, id_);
-                notValidatorIndex_ = validatorCount_;
-                validatorCount_++;
+                notValidatorIndex_ = validatorCount_++;
             }
 
-            // if/then/else (draft-07). then/else apply only when if is present.
+            // if/then/else (draft-07): then/else apply only when if is present.
             if (const ValueType* ifV = GetMember(value, GetIfString())) {
                 const ValueType* thenV = GetMember(value, GetThenString());
                 const ValueType* elseV = GetMember(value, GetElseString());
@@ -795,10 +814,10 @@ public:
         AssignIfExist(maxProperties_, value, GetMaxPropertiesString());
 
         // propertyNames (draft-06+): each object key must match the subschema as a string instance.
+        // Not in OpenAPI 2.0 / 3.0.
         if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
-            if (const ValueType* v = GetMember(value, GetPropertyNamesString())) {
+            if (const ValueType* v = GetMember(value, GetPropertyNamesString()))
                 schemaDocument->CreateSchema(&propertyNames_, p.Append(GetPropertyNamesString(), allocator_), *v, document, id_);
-            }
         }
 
         // Array
@@ -817,7 +836,7 @@ public:
         AssignIfExist(minItems_, value, GetMinItemsString());
         AssignIfExist(maxItems_, value, GetMaxItemsString());
 
-        // AdditionalItems not supported for openapi 2.0 and 3.0
+        // additionalItems not supported for OpenAPI 2.0 / 3.0
         if (spec_.oapi != kVersion20 && spec_.oapi != kVersion30)
         if (const ValueType* v = GetMember(value, GetAdditionalItemsString())) {
             if (v->IsBool())
@@ -828,12 +847,11 @@ public:
 
         AssignIfExist(uniqueItems_, value, GetUniqueItemsString());
 
-        // contains (draft-06+): at least one array element matches the subschema.
+        // contains (draft-06+): at least one array element must match the subschema.
         // Not in OpenAPI 2.0 / 3.0.
         if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
-            if (const ValueType* v = GetMember(value, GetContainsString())) {
+            if (const ValueType* v = GetMember(value, GetContainsString()))
                 schemaDocument->CreateSchema(&contains_, p.Append(GetContainsString(), allocator_), *v, document, id_);
-            }
         }
 
         // String
@@ -920,6 +938,11 @@ public:
         return pointer_;
     }
 
+    //! Subschema for propertyNames, or null if absent.
+    const SchemaType* GetPropertyNamesSchema() const {
+        return propertyNames_;
+    }
+
     bool BeginValue(Context& context) const {
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::BeginValue");
         if (context.inArray) {
@@ -992,15 +1015,21 @@ public:
             }
         }
 
-        // For enums only check if we have a hasher
-        if (enum_ && context.hasher) {
+        // enum / const: compare instance hash against allowed value hash(es)
+        if ((enum_ || hasConst_) && context.hasher) {
             const uint64_t h = context.factory.GetHashCode(context.hasher);
-            for (SizeType i = 0; i < enumCount_; i++)
-                if (enum_[i] == h)
-                    goto foundEnum;
-            context.error_handler.DisallowedValue(kValidateErrorEnum);
-            RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorEnum);
-            foundEnum:;
+            if (enum_) {
+                for (SizeType i = 0; i < enumCount_; i++)
+                    if (enum_[i] == h)
+                        goto foundEnum;
+                context.error_handler.DisallowedValue(kValidateErrorEnum);
+                RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorEnum);
+                foundEnum:;
+            }
+            if (hasConst_ && h != constHash_) {
+                context.error_handler.DisallowedValue(kValidateErrorConst);
+                RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorConst);
+            }
         }
 
         // Only check allOf etc if we have validators
@@ -1045,7 +1074,7 @@ public:
                 RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorNot);
             }
 
-            // if/then/else: if valid → then must hold (when present); if invalid → else must hold (when present).
+            // if/then/else: if matched → then (when present); if not matched → else (when present).
             if (if_) {
                 const bool ifMatched = context.validators[ifValidatorIndex_]->IsValid();
                 if (ifMatched) {
@@ -1054,11 +1083,9 @@ public:
                         RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorThen);
                     }
                 }
-                else {
-                    if (else_ && !context.validators[elseValidatorIndex_]->IsValid()) {
-                        context.error_handler.NotElse(context.validators[elseValidatorIndex_]);
-                        RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorElse);
-                    }
+                else if (else_ && !context.validators[elseValidatorIndex_]->IsValid()) {
+                    context.error_handler.NotElse(context.validators[elseValidatorIndex_]);
+                    RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorElse);
                 }
             }
         }
@@ -1233,9 +1260,6 @@ public:
         return true;
     }
 
-    //! Subschema for draft-06 propertyNames, or null if absent.
-    const SchemaType* GetPropertyNamesSchema() const { return propertyNames_; }
-
     bool EndObject(Context& context, SizeType memberCount) const {
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::EndObject");
         if (hasRequired_) {
@@ -1346,6 +1370,7 @@ public:
             case kValidateErrorDependencies:            return GetDependenciesString();
 
             case kValidateErrorEnum:                    return GetEnumString();
+            case kValidateErrorConst:                   return GetConstString();
             case kValidateErrorType:                    return GetTypeString();
 
             case kValidateErrorOneOf:                   return GetOneOfString();
@@ -1361,7 +1386,6 @@ public:
             case kValidateErrorElse:                    return GetElseString();
 
             case kValidateErrorContains:                return GetContainsString();
-
             case kValidateErrorPropertyNames:           return GetPropertyNamesString();
 
             default:                                    return GetNullString();
@@ -1386,6 +1410,7 @@ public:
     RAPIDJSON_STRING_(Integer, 'i', 'n', 't', 'e', 'g', 'e', 'r')
     RAPIDJSON_STRING_(Type, 't', 'y', 'p', 'e')
     RAPIDJSON_STRING_(Enum, 'e', 'n', 'u', 'm')
+    RAPIDJSON_STRING_(Const, 'c', 'o', 'n', 's', 't')
     RAPIDJSON_STRING_(AllOf, 'a', 'l', 'l', 'O', 'f')
     RAPIDJSON_STRING_(AnyOf, 'a', 'n', 'y', 'O', 'f')
     RAPIDJSON_STRING_(OneOf, 'o', 'n', 'e', 'O', 'f')
@@ -1556,10 +1581,10 @@ private:
     }
 
     // Creates parallel validators for allOf, anyOf, oneOf, not, if/then/else and schema dependencies, if required.
-    // Also creates a hasher for enums and array uniqueness, if required.
+    // Also creates a hasher for enum, const and array uniqueness, if required.
     // Also a useful place to add type-independent error checks.
     bool CreateParallelValidator(Context& context) const {
-        if (enum_ || context.arrayUniqueness)
+        if (enum_ || hasConst_ || context.arrayUniqueness)
             context.hasher = context.factory.CreateHasher();
 
         if (validatorCount_) {
@@ -1809,6 +1834,8 @@ private:
     const SchemaType* typeless_;
     uint64_t* enum_;
     SizeType enumCount_;
+    uint64_t constHash_;
+    bool hasConst_;
     SchemaArray allOf_;
     SchemaArray anyOf_;
     SchemaArray oneOf_;

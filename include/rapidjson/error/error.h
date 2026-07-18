@@ -202,7 +202,9 @@ enum ValidateErrorCode {
 
     kValidateErrorContains,                    //!< Array has no element matching the 'contains' sub-schema.
 
-    kValidateErrorPropertyNames                //!< Object has a property name that does not match the 'propertyNames' sub-schema.
+    kValidateErrorPropertyNames,               //!< Object has a property name that does not match the 'propertyNames' sub-schema.
+
+    kValidateErrorConst                        //!< Property has a value that does not match the 'const' value.
 };
 
 //! Function pointer type of GetValidateError().
