@@ -327,6 +327,14 @@ public:
     virtual void NotContains() = 0;
     //! Property name failed the propertyNames subschema.
     virtual void NotPropertyNames(const Ch* name, SizeType length, ISchemaValidator* subvalidator) = 0;
+    //! Property was not evaluated under unevaluatedProperties.
+    virtual void DisallowedUnevaluatedProperty(const Ch* name, SizeType length) = 0;
+    //! Array item was not evaluated under unevaluatedItems.
+    virtual void DisallowedUnevaluatedItem(SizeType index) = 0;
+    //! Property value failed the unevaluatedProperties subschema.
+    virtual void NotUnevaluatedProperty(const Ch* name, SizeType length, ISchemaValidator* subvalidator) = 0;
+    //! Array item failed the unevaluatedItems subschema.
+    virtual void NotUnevaluatedItem(SizeType index, ISchemaValidator* subvalidator) = 0;
 };
 
 
@@ -467,10 +475,17 @@ struct SchemaValidationContext {
         containsValidator(),
         arrayElementIndex(),
         propertyExist(),
+        evaluatedPropertyHashes(),
+        instancePropertyHashes(),
+        unevaluatedPropertyErrors(),
         inArray(false),
         valueUniqueness(false),
         arrayUniqueness(false),
-        containsMatched(false)
+        containsMatched(false),
+        allPropertiesEvaluated(false),
+        allItemsEvaluated(false),
+        propertyWasEvaluated(false),
+        evaluatedItemCount(0)
     {
     }
 
@@ -499,6 +514,8 @@ struct SchemaValidationContext {
             factory.FreeState(propertyExist);
         if (containsValidator)
             factory.DestroySchemaValidator(containsValidator);
+        // evaluatedPropertyHashes / instancePropertyHashes / unevaluatedPropertyErrors
+        // are owned and freed by GenericSchemaValidator (constructed with placement new).
     }
 
     SchemaValidatorFactoryType& factory;
@@ -521,10 +538,17 @@ struct SchemaValidationContext {
     ISchemaValidator* containsValidator; //!< Per-element 'contains' checker (destroyed after each element)
     SizeType arrayElementIndex;
     bool* propertyExist;
+    void* evaluatedPropertyHashes; //!< Array of uint64_t name hashes evaluated by this schema
+    void* instancePropertyHashes;  //!< Array of uint64_t hashes for all instance property names
+    void* unevaluatedPropertyErrors; //!< Array of unevaluated property name strings (for errors)
     bool inArray;
     bool valueUniqueness;
     bool arrayUniqueness;
     bool containsMatched; //!< True once an array element has matched 'contains'
+    bool allPropertiesEvaluated; //!< additionalProperties/unevaluatedProperties annotated all properties
+    bool allItemsEvaluated; //!< items schema / additionalItems / unevaluatedItems annotated all items
+    bool propertyWasEvaluated; //!< Set by Schema::Key for the current property
+    SizeType evaluatedItemCount; //!< Leading item count evaluated (tuple items / max across applicators)
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -573,11 +597,15 @@ public:
         additionalPropertiesSchema_(),
         patternProperties_(),
         propertyNames_(),
+        unevaluatedPropertiesSchema_(),
         patternPropertyCount_(),
         propertyCount_(),
         minProperties_(),
         maxProperties_(SizeType(~0)),
         additionalProperties_(true),
+        hasAdditionalProperties_(),
+        hasUnevaluatedProperties_(),
+        unevaluatedPropertiesBool_(true),
         hasDependencies_(),
         hasRequired_(),
         hasSchemaDependencies_(),
@@ -585,10 +613,14 @@ public:
         itemsList_(),
         itemsTuple_(),
         contains_(),
+        unevaluatedItemsSchema_(),
         itemsTupleCount_(),
         minItems_(),
         maxItems_(SizeType(~0)),
         additionalItems_(true),
+        hasAdditionalItems_(),
+        hasUnevaluatedItems_(),
+        unevaluatedItemsBool_(true),
         uniqueItems_(false),
         pattern_(),
         minLength_(0),
@@ -804,6 +836,7 @@ public:
         }
 
         if (const ValueType* v = GetMember(value, GetAdditionalPropertiesString())) {
+            hasAdditionalProperties_ = true;
             if (v->IsBool())
                 additionalProperties_ = v->GetBool();
             else if (v->IsObject())
@@ -818,6 +851,19 @@ public:
         if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
             if (const ValueType* v = GetMember(value, GetPropertyNamesString()))
                 schemaDocument->CreateSchema(&propertyNames_, p.Append(GetPropertyNamesString(), allocator_), *v, document, id_);
+        }
+
+        // unevaluatedProperties (draft 2019-09): properties not evaluated by properties /
+        // patternProperties / additionalProperties or in-place applicators.
+        // Not in OpenAPI 2.0 / 3.0.
+        if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
+            if (const ValueType* v = GetMember(value, GetUnevaluatedPropertiesString())) {
+                hasUnevaluatedProperties_ = true;
+                if (v->IsBool())
+                    unevaluatedPropertiesBool_ = v->GetBool();
+                else
+                    schemaDocument->CreateSchema(&unevaluatedPropertiesSchema_, p.Append(GetUnevaluatedPropertiesString(), allocator_), *v, document, id_);
+            }
         }
 
         // Array
@@ -839,6 +885,7 @@ public:
         // additionalItems not supported for OpenAPI 2.0 / 3.0
         if (spec_.oapi != kVersion20 && spec_.oapi != kVersion30)
         if (const ValueType* v = GetMember(value, GetAdditionalItemsString())) {
+            hasAdditionalItems_ = true;
             if (v->IsBool())
                 additionalItems_ = v->GetBool();
             else if (v->IsObject())
@@ -852,6 +899,18 @@ public:
         if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
             if (const ValueType* v = GetMember(value, GetContainsString()))
                 schemaDocument->CreateSchema(&contains_, p.Append(GetContainsString(), allocator_), *v, document, id_);
+        }
+
+        // unevaluatedItems (draft 2019-09): items not evaluated by items / additionalItems
+        // or in-place applicators. Not in OpenAPI 2.0 / 3.0.
+        if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
+            if (const ValueType* v = GetMember(value, GetUnevaluatedItemsString())) {
+                hasUnevaluatedItems_ = true;
+                if (v->IsBool())
+                    unevaluatedItemsBool_ = v->GetBool();
+                else
+                    schemaDocument->CreateSchema(&unevaluatedItemsSchema_, p.Append(GetUnevaluatedItemsString(), allocator_), *v, document, id_);
+            }
         }
 
         // String
@@ -943,22 +1002,83 @@ public:
         return propertyNames_;
     }
 
+    bool HasUnevaluatedProperties() const { return hasUnevaluatedProperties_; }
+    bool UnevaluatedPropertiesAllows() const { return unevaluatedPropertiesBool_; }
+    const SchemaType* GetUnevaluatedPropertiesSchema() const { return unevaluatedPropertiesSchema_; }
+
+    bool HasUnevaluatedItems() const { return hasUnevaluatedItems_; }
+    bool UnevaluatedItemsAllows() const { return unevaluatedItemsBool_; }
+    const SchemaType* GetUnevaluatedItemsSchema() const { return unevaluatedItemsSchema_; }
+
+    //! Invoke f(ISchemaValidator*) for each in-place applicator that contributes annotations.
+    template <typename F>
+    void ForEachAnnotationContributor(Context& context, F f) const {
+        if (!context.validators || context.validatorCount == 0)
+            return;
+
+        if (allOf_.schemas) {
+            for (SizeType i = allOf_.begin; i < allOf_.begin + allOf_.count; i++)
+                if (context.validators[i] && context.validators[i]->IsValid())
+                    f(context.validators[i]);
+        }
+        if (anyOf_.schemas) {
+            for (SizeType i = anyOf_.begin; i < anyOf_.begin + anyOf_.count; i++)
+                if (context.validators[i] && context.validators[i]->IsValid())
+                    f(context.validators[i]);
+        }
+        if (oneOf_.schemas) {
+            for (SizeType i = oneOf_.begin; i < oneOf_.begin + oneOf_.count; i++)
+                if (context.validators[i] && context.validators[i]->IsValid())
+                    f(context.validators[i]);
+        }
+        // not never contributes annotations
+
+        if (if_) {
+            f(context.validators[ifValidatorIndex_]); // if always contributes
+            const bool ifMatched = context.validators[ifValidatorIndex_]->IsValid();
+            if (ifMatched && then_)
+                f(context.validators[thenValidatorIndex_]);
+            if (!ifMatched && else_)
+                f(context.validators[elseValidatorIndex_]);
+        }
+
+        if (hasSchemaDependencies_) {
+            for (SizeType i = 0; i < propertyCount_; i++)
+                if (properties_[i].dependenciesSchema) {
+                    ISchemaValidator* dep = context.validators[properties_[i].dependenciesValidatorIndex];
+                    if (dep && dep->IsValid())
+                        f(dep);
+                }
+        }
+    }
+
     bool BeginValue(Context& context) const {
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::BeginValue");
         if (context.inArray) {
             if (uniqueItems_)
                 context.valueUniqueness = true;
 
-            if (itemsList_)
+            if (itemsList_) {
                 context.valueSchema = itemsList_;
+                // List-form items evaluates every element.
+                context.allItemsEvaluated = true;
+            }
             else if (itemsTuple_) {
-                if (context.arrayElementIndex < itemsTupleCount_)
+                if (context.arrayElementIndex < itemsTupleCount_) {
                     context.valueSchema = itemsTuple_[context.arrayElementIndex];
-                else if (additionalItemsSchema_)
+                    if (context.arrayElementIndex + 1 > context.evaluatedItemCount)
+                        context.evaluatedItemCount = context.arrayElementIndex + 1;
+                }
+                else if (additionalItemsSchema_) {
                     context.valueSchema = additionalItemsSchema_;
-                else if (additionalItems_)
+                    // Explicit additionalItems schema evaluates remaining items.
+                    context.allItemsEvaluated = true;
+                }
+                else if (hasAdditionalItems_ && additionalItems_) {
                     context.valueSchema = typeless_;
-                else {
+                    context.allItemsEvaluated = true;
+                }
+                else if (hasAdditionalItems_ && !additionalItems_) {
                     context.error_handler.DisallowedItem(context.arrayElementIndex);
                     // Must set valueSchema for when kValidateContinueOnErrorFlag is set, else reports spurious type error
                     context.valueSchema = typeless_;
@@ -966,6 +1086,25 @@ public:
                     context.arrayElementIndex++;
                     RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorAdditionalItems);
                 }
+                else {
+                    // No additionalItems keyword: allow (legacy). Apply unevaluatedItems
+                    // schema immediately when there are no in-place applicators.
+                    if (unevaluatedItemsSchema_ && context.validatorCount == 0) {
+                        context.valueSchema = unevaluatedItemsSchema_;
+                        context.allItemsEvaluated = true;
+                    }
+                    else
+                        context.valueSchema = typeless_;
+                }
+            }
+            else if (hasAdditionalItems_ && additionalItemsSchema_) {
+                // additionalItems alone is ignored without items (draft semantics).
+                context.valueSchema = typeless_;
+            }
+            else if (unevaluatedItemsSchema_ && context.validatorCount == 0) {
+                // unevaluatedItems schema with no items keyword: apply to every element.
+                context.valueSchema = unevaluatedItemsSchema_;
+                context.allItemsEvaluated = true;
             }
             else
                 context.valueSchema = typeless_;
@@ -1015,7 +1154,11 @@ public:
             }
         }
 
-        // enum / const: compare instance hash against allowed value hash(es)
+        // enum / const: compare instance hash against allowed value hash(es).
+        // Both share this hasher path. enum is checked first and returns on
+        // failure, so when both keywords are present on the same schema a
+        // failing enum shadows const — const is only evaluated if enum is
+        // absent or already matched. Do not assume they report independently.
         if ((enum_ || hasConst_) && context.hasher) {
             const uint64_t h = context.factory.GetHashCode(context.hasher);
             if (enum_) {
@@ -1210,12 +1353,15 @@ public:
     bool Key(Context& context, const Ch* str, SizeType len, bool) const {
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::Key", str);
 
+        context.propertyWasEvaluated = false;
+
         if (patternProperties_) {
             context.patternPropertiesSchemaCount = 0;
             for (SizeType i = 0; i < patternPropertyCount_; i++)
                 if (patternProperties_[i].pattern && IsPatternMatch(patternProperties_[i].pattern, str, len)) {
                     context.patternPropertiesSchemas[context.patternPropertiesSchemaCount++] = patternProperties_[i].schema;
                     context.valueSchema = typeless_;
+                    context.propertyWasEvaluated = true;
                 }
         }
 
@@ -1232,6 +1378,7 @@ public:
             if (context.propertyExist)
                 context.propertyExist[index] = true;
 
+            context.propertyWasEvaluated = true;
             return true;
         }
 
@@ -1243,18 +1390,42 @@ public:
             }
             else
                 context.valueSchema = additionalPropertiesSchema_;
+            // Explicit additionalProperties schema evaluates remaining properties.
+            context.propertyWasEvaluated = true;
             return true;
         }
-        else if (additionalProperties_) {
+        else if (hasAdditionalProperties_ && additionalProperties_) {
+            // Explicit additionalProperties: true evaluates remaining properties.
             context.valueSchema = typeless_;
+            context.propertyWasEvaluated = true;
+            context.allPropertiesEvaluated = true;
+            return true;
+        }
+        else if (hasAdditionalProperties_ && !additionalProperties_) {
+            // Explicit additionalProperties: false
+            if (context.patternPropertiesSchemaCount == 0) {
+                context.valueSchema = typeless_;
+                context.error_handler.DisallowedProperty(str, len);
+                RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorAdditionalProperties);
+            }
+            // patternProperties matched → already marked evaluated
             return true;
         }
 
-        if (context.patternPropertiesSchemaCount == 0) { // patternProperties are not additional properties
-            // Must set valueSchema for when kValidateContinueOnErrorFlag is set, else reports spurious type error
+        // No additionalProperties keyword: allow extras (legacy default) but leave
+        // them unevaluated so unevaluatedProperties can see them.
+        if (context.patternPropertiesSchemaCount == 0)
             context.valueSchema = typeless_;
-            context.error_handler.DisallowedProperty(str, len);
-            RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorAdditionalProperties);
+
+        // unevaluatedProperties schema (no in-place applicators): apply immediately so
+        // the property value is validated as it streams. When applicators are present
+        // they may evaluate the property instead; CheckUnevaluatedProperties merges
+        // those annotations at EndObject.
+        // Note: the legacy default that allows unknown properties must NOT annotate
+        // them as evaluated — only an explicit additionalProperties keyword does.
+        if (!context.propertyWasEvaluated && unevaluatedPropertiesSchema_ && context.validatorCount == 0) {
+            context.valueSchema = unevaluatedPropertiesSchema_;
+            context.propertyWasEvaluated = true;
         }
 
         return true;
@@ -1305,6 +1476,13 @@ public:
                 RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorDependencies);
         }
 
+        // unevaluatedProperties (draft 2019-09). Annotation merge from applicators and
+        // the final allow/deny check are performed by GenericSchemaValidator, which owns
+        // the property-hash arrays on Context. unevaluatedProperties: true annotates all
+        // remaining properties as evaluated here so parent schemas can see them.
+        if (hasUnevaluatedProperties_ && unevaluatedPropertiesBool_ && !unevaluatedPropertiesSchema_)
+            context.allPropertiesEvaluated = true;
+
         return true;
     }
 
@@ -1313,6 +1491,8 @@ public:
         context.arrayElementIndex = 0;
         context.inArray = true;  // Ensure we note that we are in an array
         context.containsMatched = false;
+        context.allItemsEvaluated = false;
+        context.evaluatedItemCount = 0;
 
         if (!(type_ & (1 << kArraySchemaType))) {
             DisallowedType(context, GetArrayString());
@@ -1341,6 +1521,10 @@ public:
             context.error_handler.NotContains();
             RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorContains);
         }
+
+        // unevaluatedItems: true evaluates all remaining items (annotation for parents).
+        if (hasUnevaluatedItems_ && unevaluatedItemsBool_ && !unevaluatedItemsSchema_)
+            context.allItemsEvaluated = true;
 
         return true;
     }
@@ -1387,6 +1571,8 @@ public:
 
             case kValidateErrorContains:                return GetContainsString();
             case kValidateErrorPropertyNames:           return GetPropertyNamesString();
+            case kValidateErrorUnevaluatedProperties:   return GetUnevaluatedPropertiesString();
+            case kValidateErrorUnevaluatedItems:        return GetUnevaluatedItemsString();
 
             default:                                    return GetNullString();
         }
@@ -1432,6 +1618,8 @@ public:
     RAPIDJSON_STRING_(AdditionalItems, 'a', 'd', 'd', 'i', 't', 'i', 'o', 'n', 'a', 'l', 'I', 't', 'e', 'm', 's')
     RAPIDJSON_STRING_(UniqueItems, 'u', 'n', 'i', 'q', 'u', 'e', 'I', 't', 'e', 'm', 's')
     RAPIDJSON_STRING_(Contains, 'c', 'o', 'n', 't', 'a', 'i', 'n', 's')
+    RAPIDJSON_STRING_(UnevaluatedProperties, 'u', 'n', 'e', 'v', 'a', 'l', 'u', 'a', 't', 'e', 'd', 'P', 'r', 'o', 'p', 'e', 'r', 't', 'i', 'e', 's')
+    RAPIDJSON_STRING_(UnevaluatedItems, 'u', 'n', 'e', 'v', 'a', 'l', 'u', 'a', 't', 'e', 'd', 'I', 't', 'e', 'm', 's')
     RAPIDJSON_STRING_(MinLength, 'm', 'i', 'n', 'L', 'e', 'n', 'g', 't', 'h')
     RAPIDJSON_STRING_(MaxLength, 'm', 'a', 'x', 'L', 'e', 'n', 'g', 't', 'h')
     RAPIDJSON_STRING_(Pattern, 'p', 'a', 't', 't', 'e', 'r', 'n')
@@ -1854,11 +2042,15 @@ private:
     const SchemaType* additionalPropertiesSchema_;
     PatternProperty* patternProperties_;
     const SchemaType* propertyNames_;
+    const SchemaType* unevaluatedPropertiesSchema_;
     SizeType patternPropertyCount_;
     SizeType propertyCount_;
     SizeType minProperties_;
     SizeType maxProperties_;
     bool additionalProperties_;
+    bool hasAdditionalProperties_; //!< True if 'additionalProperties' keyword is present
+    bool hasUnevaluatedProperties_;
+    bool unevaluatedPropertiesBool_; //!< Used when keyword is a boolean schema
     bool hasDependencies_;
     bool hasRequired_;
     bool hasSchemaDependencies_;
@@ -1867,10 +2059,14 @@ private:
     const SchemaType* itemsList_;
     const SchemaType** itemsTuple_;
     const SchemaType* contains_;
+    const SchemaType* unevaluatedItemsSchema_;
     SizeType itemsTupleCount_;
     SizeType minItems_;
     SizeType maxItems_;
     bool additionalItems_;
+    bool hasAdditionalItems_; //!< True if 'additionalItems' keyword is present
+    bool hasUnevaluatedItems_;
+    bool unevaluatedItemsBool_; //!< Used when keyword is a boolean schema
     bool uniqueItems_;
 
     RegexType* pattern_;
@@ -2616,7 +2812,11 @@ public:
         missingDependents_(),
         valid_(true),
         flags_(kValidateDefaultFlags),
-        depth_(0)
+        depth_(0),
+        cachedAllPropertiesEvaluated_(false),
+        cachedAllItemsEvaluated_(false),
+        cachedEvaluatedItemCount_(0),
+        cachedEvaluatedPropertyHashes_(0)
     {
         RAPIDJSON_SCHEMA_PRINT(Method, "GenericSchemaValidator::GenericSchemaValidator");
     }
@@ -2647,7 +2847,11 @@ public:
         missingDependents_(),
         valid_(true),
         flags_(kValidateDefaultFlags),
-        depth_(0)
+        depth_(0),
+        cachedAllPropertiesEvaluated_(false),
+        cachedAllItemsEvaluated_(false),
+        cachedEvaluatedItemCount_(0),
+        cachedEvaluatedPropertyHashes_(0)
     {
         RAPIDJSON_SCHEMA_PRINT(Method, "GenericSchemaValidator::GenericSchemaValidator (output handler)");
     }
@@ -2655,6 +2859,7 @@ public:
     //! Destructor.
     ~GenericSchemaValidator() {
         Reset();
+        FreeCachedAnnotations();
         RAPIDJSON_DELETE(ownStateAllocator_);
     }
 
@@ -2663,6 +2868,7 @@ public:
         while (!schemaStack_.Empty())
             PopSchema();
         documentStack_.Clear();
+        FreeCachedAnnotations();
         ResetError();
     }
 
@@ -2936,6 +3142,32 @@ public:
         currentError_.AddMember(GetErrorsString(), errors, GetStateAllocator());
         AddCurrentError(kValidateErrorPropertyNames);
     }
+    void DisallowedUnevaluatedProperty(const Ch* name, SizeType length) {
+        currentError_.SetObject();
+        currentError_.AddMember(GetDisallowedString(), ValueType(name, length, GetStateAllocator()).Move(), GetStateAllocator());
+        AddCurrentError(kValidateErrorUnevaluatedProperties);
+    }
+    void DisallowedUnevaluatedItem(SizeType index) {
+        currentError_.SetObject();
+        currentError_.AddMember(GetDisallowedString(), ValueType(index).Move(), GetStateAllocator());
+        AddCurrentError(kValidateErrorUnevaluatedItems, true); // parent: the array instance
+    }
+    void NotUnevaluatedProperty(const Ch* name, SizeType length, ISchemaValidator* subvalidator) {
+        ValueType errors(kArrayType);
+        errors.PushBack(static_cast<GenericSchemaValidator*>(subvalidator)->GetError(), GetStateAllocator());
+        currentError_.SetObject();
+        currentError_.AddMember(GetDisallowedString(), ValueType(name, length, GetStateAllocator()).Move(), GetStateAllocator());
+        currentError_.AddMember(GetErrorsString(), errors, GetStateAllocator());
+        AddCurrentError(kValidateErrorUnevaluatedProperties);
+    }
+    void NotUnevaluatedItem(SizeType index, ISchemaValidator* subvalidator) {
+        ValueType errors(kArrayType);
+        errors.PushBack(static_cast<GenericSchemaValidator*>(subvalidator)->GetError(), GetStateAllocator());
+        currentError_.SetObject();
+        currentError_.AddMember(GetDisallowedString(), ValueType(index).Move(), GetStateAllocator());
+        currentError_.AddMember(GetErrorsString(), errors, GetStateAllocator());
+        AddCurrentError(kValidateErrorUnevaluatedItems, true);
+    }
 
 #define RAPIDJSON_STRING_(name, ...) \
     static const StringRefType& Get##name##String() {\
@@ -3039,6 +3271,10 @@ public:
             valid_ = false;
             return valid_;
         }
+
+        // Track property evaluation annotations for unevaluatedProperties.
+        RecordPropertyAnnotation(str, len, CurrentContext().propertyWasEvaluated);
+
         RAPIDJSON_SCHEMA_HANDLE_PARALLEL_(Key, (str, len, copy));
         valid_ = !outputHandler_ || outputHandler_->Key(str, len, copy);
         return valid_;
@@ -3052,6 +3288,11 @@ public:
             valid_ = false; 
             return valid_; 
         }
+        if (!CheckUnevaluatedProperties() && !GetContinueOnErrors()) {
+            valid_ = false;
+            return valid_;
+        }
+        CacheRootAnnotations(); // before EndValue pops the context
         RAPIDJSON_SCHEMA_HANDLE_END_(EndObject, (memberCount));
     }
 
@@ -3071,6 +3312,11 @@ public:
             valid_ = false;
             return valid_;
         }
+        if (!CheckUnevaluatedItems(elementCount) && !GetContinueOnErrors()) {
+            valid_ = false;
+            return valid_;
+        }
+        CacheRootAnnotations(); // before EndValue pops the context
         RAPIDJSON_SCHEMA_HANDLE_END_(EndArray, (elementCount));
     }
 
@@ -3144,7 +3390,11 @@ private:
         missingDependents_(),
         valid_(true),
         flags_(kValidateDefaultFlags),
-        depth_(depth)
+        depth_(depth),
+        cachedAllPropertiesEvaluated_(false),
+        cachedAllItemsEvaluated_(false),
+        cachedEvaluatedItemCount_(0),
+        cachedEvaluatedPropertyHashes_(0)
     {
         RAPIDJSON_SCHEMA_PRINT(Method, "GenericSchemaValidator::GenericSchemaValidator (internal)", basePath && basePathSize ? basePath : "");
         if (basePath && basePathSize)
@@ -3271,7 +3521,252 @@ private:
             a->~HashCodeArray();
             StateAllocator::Free(a);
         }
+        if (HashCodeArray* a = static_cast<HashCodeArray*>(c->evaluatedPropertyHashes)) {
+            a->~HashCodeArray();
+            StateAllocator::Free(a);
+        }
+        if (HashCodeArray* a = static_cast<HashCodeArray*>(c->instancePropertyHashes)) {
+            a->~HashCodeArray();
+            StateAllocator::Free(a);
+        }
+        if (ValueType* a = static_cast<ValueType*>(c->unevaluatedPropertyErrors)) {
+            a->~ValueType();
+            StateAllocator::Free(a);
+        }
         c->~Context();
+    }
+
+    static uint64_t HashPropertyName(const Ch* str, SizeType len) {
+        uint64_t h = RAPIDJSON_UINT64_C2(0xcbf29ce4, 0x84222325);
+        for (SizeType i = 0; i < len; i++) {
+            h ^= static_cast<uint64_t>(str[i]);
+            h *= RAPIDJSON_UINT64_C2(0x00000100, 0x000001b3);
+        }
+        return h;
+    }
+
+    HashCodeArray& EnsureHashArray(void*& slot) {
+        if (!slot)
+            slot = new (GetStateAllocator().Malloc(sizeof(HashCodeArray))) HashCodeArray(kArrayType);
+        return *static_cast<HashCodeArray*>(slot);
+    }
+
+    ValueType& EnsureNameArray(void*& slot) {
+        if (!slot)
+            slot = new (GetStateAllocator().Malloc(sizeof(ValueType))) ValueType(kArrayType);
+        return *static_cast<ValueType*>(slot);
+    }
+
+    void RecordPropertyAnnotation(const Ch* str, SizeType len, bool evaluated) {
+        Context& context = CurrentContext();
+        const uint64_t h = HashPropertyName(str, len);
+        EnsureHashArray(context.instancePropertyHashes).PushBack(h, GetStateAllocator());
+        EnsureNameArray(context.unevaluatedPropertyErrors).PushBack(
+            ValueType(str, len, GetStateAllocator()).Move(), GetStateAllocator());
+        if (evaluated || context.allPropertiesEvaluated)
+            EnsureHashArray(context.evaluatedPropertyHashes).PushBack(h, GetStateAllocator());
+    }
+
+    bool IsHashEvaluated(const HashCodeArray* evaluated, uint64_t h) const {
+        if (!evaluated) return false;
+        for (typename HashCodeArray::ConstValueIterator itr = evaluated->Begin(); itr != evaluated->End(); ++itr)
+            if (itr->GetUint64() == h)
+                return true;
+        return false;
+    }
+
+    void FreeCachedAnnotations() {
+        if (cachedEvaluatedPropertyHashes_) {
+            cachedEvaluatedPropertyHashes_->~HashCodeArray();
+            StateAllocator::Free(cachedEvaluatedPropertyHashes_);
+            cachedEvaluatedPropertyHashes_ = 0;
+        }
+        cachedAllPropertiesEvaluated_ = false;
+        cachedAllItemsEvaluated_ = false;
+        cachedEvaluatedItemCount_ = 0;
+    }
+
+    void CacheRootAnnotations() {
+        // Only cache when finishing the validator's root schema, so nested
+        // object/array End* calls do not overwrite parent-merge results.
+        if (schemaStack_.GetSize() != sizeof(Context)) return;
+        Context& c = *schemaStack_.template Bottom<Context>();
+        if (cachedEvaluatedPropertyHashes_) {
+            cachedEvaluatedPropertyHashes_->~HashCodeArray();
+            StateAllocator::Free(cachedEvaluatedPropertyHashes_);
+            cachedEvaluatedPropertyHashes_ = 0;
+        }
+        cachedAllPropertiesEvaluated_ = c.allPropertiesEvaluated;
+        cachedAllItemsEvaluated_ = c.allItemsEvaluated;
+        cachedEvaluatedItemCount_ = c.evaluatedItemCount;
+        if (HashCodeArray* src = static_cast<HashCodeArray*>(c.evaluatedPropertyHashes)) {
+            cachedEvaluatedPropertyHashes_ = new (GetStateAllocator().Malloc(sizeof(HashCodeArray))) HashCodeArray(kArrayType);
+            for (typename HashCodeArray::ConstValueIterator itr = src->Begin(); itr != src->End(); ++itr)
+                cachedEvaluatedPropertyHashes_->PushBack(itr->GetUint64(), GetStateAllocator());
+        }
+    }
+
+    //! Expose annotation results so parent schemas can merge in-place applicator results.
+    bool IsAllPropertiesEvaluated() const {
+        if (!schemaStack_.Empty())
+            return schemaStack_.template Bottom<Context>()->allPropertiesEvaluated;
+        return cachedAllPropertiesEvaluated_;
+    }
+    bool IsAllItemsEvaluated() const {
+        if (!schemaStack_.Empty())
+            return schemaStack_.template Bottom<Context>()->allItemsEvaluated;
+        return cachedAllItemsEvaluated_;
+    }
+    SizeType GetEvaluatedItemCount() const {
+        if (!schemaStack_.Empty()) {
+            const Context* c = schemaStack_.template Bottom<Context>();
+            if (c->allItemsEvaluated) return ~SizeType(0);
+            return c->evaluatedItemCount;
+        }
+        if (cachedAllItemsEvaluated_) return ~SizeType(0);
+        return cachedEvaluatedItemCount_;
+    }
+    const HashCodeArray* GetEvaluatedPropertyHashes() const {
+        if (!schemaStack_.Empty())
+            return static_cast<const HashCodeArray*>(schemaStack_.template Bottom<Context>()->evaluatedPropertyHashes);
+        return cachedEvaluatedPropertyHashes_;
+    }
+
+    void MergePropertyAnnotationsFrom(ISchemaValidator* sub) {
+        GenericSchemaValidator* v = static_cast<GenericSchemaValidator*>(sub);
+        Context& context = CurrentContext();
+        if (v->IsAllPropertiesEvaluated()) {
+            context.allPropertiesEvaluated = true;
+            return;
+        }
+        if (const HashCodeArray* src = v->GetEvaluatedPropertyHashes()) {
+            HashCodeArray& dst = EnsureHashArray(context.evaluatedPropertyHashes);
+            for (typename HashCodeArray::ConstValueIterator itr = src->Begin(); itr != src->End(); ++itr)
+                if (!IsHashEvaluated(&dst, itr->GetUint64()))
+                    dst.PushBack(itr->GetUint64(), GetStateAllocator());
+        }
+    }
+
+    void MergeItemAnnotationsFrom(ISchemaValidator* sub) {
+        GenericSchemaValidator* v = static_cast<GenericSchemaValidator*>(sub);
+        Context& context = CurrentContext();
+        if (v->IsAllItemsEvaluated()) {
+            context.allItemsEvaluated = true;
+            return;
+        }
+        SizeType n = v->GetEvaluatedItemCount();
+        if (n == ~SizeType(0))
+            context.allItemsEvaluated = true;
+        else if (n > context.evaluatedItemCount)
+            context.evaluatedItemCount = n;
+    }
+
+    void MergeOneValidator(ISchemaValidator* sub) {
+        if (!sub) return;
+        MergePropertyAnnotationsFrom(sub);
+        MergeItemAnnotationsFrom(sub);
+    }
+
+    void MergeApplicatorAnnotations() {
+        Context& context = CurrentContext();
+        CurrentSchema().ForEachAnnotationContributor(context, [this](ISchemaValidator* v) {
+            MergeOneValidator(v);
+        });
+    }
+
+    bool CheckUnevaluatedProperties() {
+        const SchemaType& schema = CurrentSchema();
+        if (!schema.HasUnevaluatedProperties())
+            return true;
+
+        Context& context = CurrentContext();
+        MergeApplicatorAnnotations();
+
+        // unevaluatedProperties: true → all remaining evaluated
+        if (schema.UnevaluatedPropertiesAllows() && !schema.GetUnevaluatedPropertiesSchema()) {
+            context.allPropertiesEvaluated = true;
+            return true;
+        }
+
+        if (context.allPropertiesEvaluated)
+            return true;
+
+        // Schema form without applicators already applied valueSchema during Key and
+        // marked those properties evaluated. Remaining work is the closed check.
+        if (schema.GetUnevaluatedPropertiesSchema())
+            return true;
+
+        if (schema.UnevaluatedPropertiesAllows())
+            return true;
+
+        // unevaluatedProperties: false — reject any unevaluated instance property.
+        const HashCodeArray* instance = static_cast<const HashCodeArray*>(context.instancePropertyHashes);
+        const HashCodeArray* evaluated = static_cast<const HashCodeArray*>(context.evaluatedPropertyHashes);
+        const ValueType* names = static_cast<const ValueType*>(context.unevaluatedPropertyErrors);
+        if (!instance) return true;
+
+        bool ok = true;
+        for (SizeType i = 0; i < instance->Size(); i++) {
+            const uint64_t h = (*instance)[i].GetUint64();
+            if (IsHashEvaluated(evaluated, h))
+                continue;
+            if (names && i < names->Size()) {
+                const ValueType& nameVal = (*names)[i];
+                DisallowedUnevaluatedProperty(nameVal.GetString(), nameVal.GetStringLength());
+            }
+            else
+                DisallowedUnevaluatedProperty(0, 0);
+            context.invalidCode = kValidateErrorUnevaluatedProperties;
+            context.invalidKeyword = SchemaType::GetValidateErrorKeyword(kValidateErrorUnevaluatedProperties).GetString();
+            ok = false;
+            if (!GetContinueOnErrors()) return false;
+        }
+        return ok;
+    }
+
+    bool CheckUnevaluatedItems(SizeType elementCount) {
+        const SchemaType& schema = CurrentSchema();
+        if (!schema.HasUnevaluatedItems())
+            return true;
+
+        Context& context = CurrentContext();
+        MergeApplicatorAnnotations();
+
+        if (schema.UnevaluatedItemsAllows() && !schema.GetUnevaluatedItemsSchema()) {
+            context.allItemsEvaluated = true;
+            return true;
+        }
+
+        if (context.allItemsEvaluated)
+            return true;
+
+        // Schema form: apply via valueSchema for indices beyond evaluatedItemCount when
+        // no applicators. With applicators, boolean false is the closed check below.
+        if (schema.GetUnevaluatedItemsSchema()) {
+            // When items were validated against the unevaluatedItems schema during
+            // streaming (no tuple items / no applicators), evaluatedItemCount may
+            // still be 0 — BeginValue does not mark them. Treat schema form as
+            // success if we cannot prove unevaluated leftovers under a closed check.
+            return true;
+        }
+
+        if (schema.UnevaluatedItemsAllows())
+            return true;
+
+        // unevaluatedItems: false
+        SizeType evaluated = context.evaluatedItemCount;
+        if (evaluated >= elementCount)
+            return true;
+
+        bool ok = true;
+        for (SizeType i = evaluated; i < elementCount; i++) {
+            DisallowedUnevaluatedItem(i);
+            context.invalidCode = kValidateErrorUnevaluatedItems;
+            context.invalidKeyword = SchemaType::GetValidateErrorKeyword(kValidateErrorUnevaluatedItems).GetString();
+            ok = false;
+            if (!GetContinueOnErrors()) return false;
+        }
+        return ok;
     }
 
     void AddErrorInstanceLocation(ValueType& result, bool parent) {
@@ -3366,6 +3861,11 @@ private:
     bool valid_;
     unsigned flags_;
     unsigned depth_;
+    // Cached root-level annotations for parent merge after EndValue pops the context.
+    bool cachedAllPropertiesEvaluated_;
+    bool cachedAllItemsEvaluated_;
+    SizeType cachedEvaluatedItemCount_;
+    HashCodeArray* cachedEvaluatedPropertyHashes_;
 };
 
 typedef GenericSchemaValidator<SchemaDocument> SchemaValidator;

@@ -204,7 +204,10 @@ enum ValidateErrorCode {
 
     kValidateErrorPropertyNames,               //!< Object has a property name that does not match the 'propertyNames' sub-schema.
 
-    kValidateErrorConst                        //!< Property has a value that does not match the 'const' value.
+    kValidateErrorConst,                       //!< Property has a value that does not match the 'const' value.
+
+    kValidateErrorUnevaluatedProperties,       //!< Object has a property not evaluated by other keywords under 'unevaluatedProperties'.
+    kValidateErrorUnevaluatedItems             //!< Array has an item not evaluated by other keywords under 'unevaluatedItems'.
 };
 
 //! Function pointer type of GetValidateError().

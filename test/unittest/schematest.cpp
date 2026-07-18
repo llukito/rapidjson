@@ -325,6 +325,90 @@ TEST(SchemaValidator, Const_WithType) {
         "{ \"const\": { \"errorCode\": 32, \"instanceRef\": \"#\", \"schemaRef\": \"#\" }}");
 }
 
+TEST(SchemaValidator, UnevaluatedProperties_False) {
+    Document sd;
+    sd.Parse(
+        "{"
+        "  \"properties\": { \"foo\": { \"type\": \"string\" } },"
+        "  \"unevaluatedProperties\": false"
+        "}");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "{ \"foo\": \"x\" }", true);
+    INVALIDATE(s, "{ \"foo\": \"x\", \"bar\": 1 }", "", "unevaluatedProperties", "",
+        "{ \"unevaluatedProperties\": {"
+        "    \"disallowed\": \"bar\","
+        "    \"errorCode\": 33,"
+        "    \"instanceRef\": \"#\", \"schemaRef\": \"#\""
+        "}}");
+}
+
+TEST(SchemaValidator, UnevaluatedProperties_AllOf) {
+    Document sd;
+    sd.Parse(
+        "{"
+        "  \"properties\": { \"foo\": { \"type\": \"string\" } },"
+        "  \"allOf\": [ { \"properties\": { \"bar\": { \"type\": \"string\" } } } ],"
+        "  \"unevaluatedProperties\": false"
+        "}");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "{ \"foo\": \"a\", \"bar\": \"b\" }", true);
+    INVALIDATE(s, "{ \"foo\": \"a\", \"bar\": \"b\", \"baz\": 1 }", "", "unevaluatedProperties", "",
+        "{ \"unevaluatedProperties\": {"
+        "    \"disallowed\": \"baz\","
+        "    \"errorCode\": 33,"
+        "    \"instanceRef\": \"#\", \"schemaRef\": \"#\""
+        "}}");
+}
+
+TEST(SchemaValidator, UnevaluatedProperties_Schema) {
+    Document sd;
+    sd.Parse("{ \"unevaluatedProperties\": { \"type\": \"string\", \"minLength\": 3 } }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "{ \"foo\": \"foo\" }", true);
+    INVALIDATE(s, "{ \"foo\": \"fo\" }", "/unevaluatedProperties", "minLength", "/foo",
+        "{ \"minLength\": {"
+        "    \"actual\": \"fo\", \"expected\": 3,"
+        "    \"errorCode\": 7,"
+        "    \"instanceRef\": \"#/foo\", \"schemaRef\": \"#/unevaluatedProperties\""
+        "}}");
+}
+
+TEST(SchemaValidator, UnevaluatedItems_False) {
+    Document sd;
+    sd.Parse("{ \"items\": [ { \"type\": \"string\" } ], \"unevaluatedItems\": false }");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "[ \"a\" ]", true);
+    INVALIDATE(s, "[ \"a\", \"b\" ]", "", "unevaluatedItems", "",
+        "{ \"unevaluatedItems\": {"
+        "    \"disallowed\": 1,"
+        "    \"errorCode\": 34,"
+        "    \"instanceRef\": \"#\", \"schemaRef\": \"#\""
+        "}}");
+}
+
+TEST(SchemaValidator, UnevaluatedItems_AllOf) {
+    Document sd;
+    sd.Parse(
+        "{"
+        "  \"items\": [ { \"type\": \"string\" } ],"
+        "  \"allOf\": [ { \"items\": [ true, { \"type\": \"number\" } ] } ],"
+        "  \"unevaluatedItems\": false"
+        "}");
+    SchemaDocument s(sd);
+
+    VALIDATE(s, "[ \"foo\", 42 ]", true);
+    INVALIDATE(s, "[ \"foo\", 42, true ]", "", "unevaluatedItems", "",
+        "{ \"unevaluatedItems\": {"
+        "    \"disallowed\": 2,"
+        "    \"errorCode\": 34,"
+        "    \"instanceRef\": \"#\", \"schemaRef\": \"#\""
+        "}}");
+}
+
 TEST(SchemaValidator, AllOf) {
     {
         Document sd;

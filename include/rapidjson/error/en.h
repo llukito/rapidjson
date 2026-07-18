@@ -121,6 +121,9 @@ inline const RAPIDJSON_ERROR_CHARTYPE* GetValidateError_En(ValidateErrorCode val
 
         case kValidateErrorConst:                       return RAPIDJSON_ERROR_STRING("Property has a value that does not match the 'const' value.");
 
+        case kValidateErrorUnevaluatedProperties:       return RAPIDJSON_ERROR_STRING("Object has a property that was not evaluated under 'unevaluatedProperties'.");
+        case kValidateErrorUnevaluatedItems:            return RAPIDJSON_ERROR_STRING("Array has an item that was not evaluated under 'unevaluatedItems'.");
+
         default:                                        return RAPIDJSON_ERROR_STRING("Unknown error.");
     }
 }
