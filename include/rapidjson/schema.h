@@ -323,6 +323,10 @@ public:
     virtual void NotThen(ISchemaValidator* thenValidator) = 0;
     //! 'else' failed after 'if' did not match (draft-07 if/then/else).
     virtual void NotElse(ISchemaValidator* elseValidator) = 0;
+    //! Array has no element matching 'contains'.
+    virtual void NotContains() = 0;
+    //! Property name failed the 'propertyNames' sub-schema.
+    virtual void NotPropertyNames(const Ch* name, SizeType length, ISchemaValidator* subvalidator) = 0;
 };
 
 
@@ -460,9 +464,12 @@ struct SchemaValidationContext {
         patternPropertiesSchemaCount(),
         valuePatternValidatorType(kPatternValidatorOnly),
         propertyExist(),
+        containsValidator(),
+        arrayElementIndex(),
         inArray(false),
         valueUniqueness(false),
-        arrayUniqueness(false)
+        arrayUniqueness(false),
+        containsMatched(false)
     {
     }
 
@@ -489,6 +496,8 @@ struct SchemaValidationContext {
             factory.FreeState(patternPropertiesSchemas);
         if (propertyExist)
             factory.FreeState(propertyExist);
+        if (containsValidator)
+            factory.DestroySchemaValidator(containsValidator);
     }
 
     SchemaValidatorFactoryType& factory;
@@ -508,11 +517,13 @@ struct SchemaValidationContext {
     SizeType patternPropertiesSchemaCount;
     PatternValidatorType valuePatternValidatorType;
     PatternValidatorType objectPatternValidatorType;
+    ISchemaValidator* containsValidator; //!< Per-element 'contains' checker (destroyed after each element)
     SizeType arrayElementIndex;
     bool* propertyExist;
     bool inArray;
     bool valueUniqueness;
     bool arrayUniqueness;
+    bool containsMatched; //!< True once an array element has matched 'contains'
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -555,6 +566,7 @@ public:
         properties_(),
         additionalPropertiesSchema_(),
         patternProperties_(),
+        propertyNames_(),
         patternPropertyCount_(),
         propertyCount_(),
         minProperties_(),
@@ -566,6 +578,7 @@ public:
         additionalItemsSchema_(),
         itemsList_(),
         itemsTuple_(),
+        contains_(),
         itemsTupleCount_(),
         minItems_(),
         maxItems_(SizeType(~0)),
@@ -781,6 +794,13 @@ public:
         AssignIfExist(minProperties_, value, GetMinPropertiesString());
         AssignIfExist(maxProperties_, value, GetMaxPropertiesString());
 
+        // propertyNames (draft-06+): each object key must match the subschema as a string instance.
+        if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
+            if (const ValueType* v = GetMember(value, GetPropertyNamesString())) {
+                schemaDocument->CreateSchema(&propertyNames_, p.Append(GetPropertyNamesString(), allocator_), *v, document, id_);
+            }
+        }
+
         // Array
         if (const ValueType* v = GetMember(value, GetItemsString())) {
             PointerType q = p.Append(GetItemsString(), allocator_);
@@ -807,6 +827,14 @@ public:
         }
 
         AssignIfExist(uniqueItems_, value, GetUniqueItemsString());
+
+        // contains (draft-06+): at least one array element matches the subschema.
+        // Not in OpenAPI 2.0 / 3.0.
+        if (schemaDocument && spec_.oapi != kVersion20 && spec_.oapi != kVersion30) {
+            if (const ValueType* v = GetMember(value, GetContainsString())) {
+                schemaDocument->CreateSchema(&contains_, p.Append(GetContainsString(), allocator_), *v, document, id_);
+            }
+        }
 
         // String
         AssignIfExist(minLength_, value, GetMinLengthString());
@@ -918,6 +946,12 @@ public:
             }
             else
                 context.valueSchema = typeless_;
+
+            // Start a per-element 'contains' checker until one element matches.
+            if (contains_ && !context.containsMatched) {
+                RAPIDJSON_ASSERT(context.containsValidator == 0);
+                context.containsValidator = context.factory.CreateSchemaValidator(*contains_, false);
+            }
 
             context.arrayElementIndex++;
         }
@@ -1199,6 +1233,9 @@ public:
         return true;
     }
 
+    //! Subschema for draft-06 propertyNames, or null if absent.
+    const SchemaType* GetPropertyNamesSchema() const { return propertyNames_; }
+
     bool EndObject(Context& context, SizeType memberCount) const {
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::EndObject");
         if (hasRequired_) {
@@ -1251,6 +1288,7 @@ public:
         RAPIDJSON_SCHEMA_PRINT(Method, "Schema::StartArray");
         context.arrayElementIndex = 0;
         context.inArray = true;  // Ensure we note that we are in an array
+        context.containsMatched = false;
 
         if (!(type_ & (1 << kArraySchemaType))) {
             DisallowedType(context, GetArrayString());
@@ -1272,6 +1310,12 @@ public:
         if (elementCount > maxItems_) {
             context.error_handler.TooManyItems(elementCount, maxItems_);
             RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorMaxItems);
+        }
+
+        // At least one element must match 'contains' (empty arrays never do).
+        if (contains_ && !context.containsMatched) {
+            context.error_handler.NotContains();
+            RAPIDJSON_INVALID_KEYWORD_RETURN(kValidateErrorContains);
         }
 
         return true;
@@ -1316,6 +1360,10 @@ public:
             case kValidateErrorThen:                    return GetThenString();
             case kValidateErrorElse:                    return GetElseString();
 
+            case kValidateErrorContains:                return GetContainsString();
+
+            case kValidateErrorPropertyNames:           return GetPropertyNamesString();
+
             default:                                    return GetNullString();
         }
     }
@@ -1346,6 +1394,7 @@ public:
     RAPIDJSON_STRING_(Then, 't', 'h', 'e', 'n')
     RAPIDJSON_STRING_(Else, 'e', 'l', 's', 'e')
     RAPIDJSON_STRING_(Properties, 'p', 'r', 'o', 'p', 'e', 'r', 't', 'i', 'e', 's')
+    RAPIDJSON_STRING_(PropertyNames, 'p', 'r', 'o', 'p', 'e', 'r', 't', 'y', 'N', 'a', 'm', 'e', 's')
     RAPIDJSON_STRING_(Required, 'r', 'e', 'q', 'u', 'i', 'r', 'e', 'd')
     RAPIDJSON_STRING_(Dependencies, 'd', 'e', 'p', 'e', 'n', 'd', 'e', 'n', 'c', 'i', 'e', 's')
     RAPIDJSON_STRING_(PatternProperties, 'p', 'a', 't', 't', 'e', 'r', 'n', 'P', 'r', 'o', 'p', 'e', 'r', 't', 'i', 'e', 's')
@@ -1357,6 +1406,7 @@ public:
     RAPIDJSON_STRING_(MaxItems, 'm', 'a', 'x', 'I', 't', 'e', 'm', 's')
     RAPIDJSON_STRING_(AdditionalItems, 'a', 'd', 'd', 'i', 't', 'i', 'o', 'n', 'a', 'l', 'I', 't', 'e', 'm', 's')
     RAPIDJSON_STRING_(UniqueItems, 'u', 'n', 'i', 'q', 'u', 'e', 'I', 't', 'e', 'm', 's')
+    RAPIDJSON_STRING_(Contains, 'c', 'o', 'n', 't', 'a', 'i', 'n', 's')
     RAPIDJSON_STRING_(MinLength, 'm', 'i', 'n', 'L', 'e', 'n', 'g', 't', 'h')
     RAPIDJSON_STRING_(MaxLength, 'm', 'a', 'x', 'L', 'e', 'n', 'g', 't', 'h')
     RAPIDJSON_STRING_(Pattern, 'p', 'a', 't', 't', 'e', 'r', 'n')
@@ -1776,6 +1826,7 @@ private:
     Property* properties_;
     const SchemaType* additionalPropertiesSchema_;
     PatternProperty* patternProperties_;
+    const SchemaType* propertyNames_;
     SizeType patternPropertyCount_;
     SizeType propertyCount_;
     SizeType minProperties_;
@@ -1788,6 +1839,7 @@ private:
     const SchemaType* additionalItemsSchema_;
     const SchemaType* itemsList_;
     const SchemaType** itemsTuple_;
+    const SchemaType* contains_;
     SizeType itemsTupleCount_;
     SizeType minItems_;
     SizeType maxItems_;
@@ -2845,6 +2897,18 @@ public:
     void NotElse(ISchemaValidator* elseValidator) {
         AddErrorArray(kValidateErrorElse, &elseValidator, 1);
     }
+    void NotContains() {
+        currentError_.SetObject();
+        AddCurrentError(kValidateErrorContains, true); // parent: the array instance
+    }
+    void NotPropertyNames(const Ch* name, SizeType length, ISchemaValidator* subvalidator) {
+        ValueType errors(kArrayType);
+        errors.PushBack(static_cast<GenericSchemaValidator*>(subvalidator)->GetError(), GetStateAllocator());
+        currentError_.SetObject();
+        currentError_.AddMember(GetDisallowedString(), ValueType(name, length, GetStateAllocator()).Move(), GetStateAllocator());
+        currentError_.AddMember(GetErrorsString(), errors, GetStateAllocator());
+        AddCurrentError(kValidateErrorPropertyNames);
+    }
 
 #define RAPIDJSON_STRING_(name, ...) \
     static const StringRefType& Get##name##String() {\
@@ -2887,6 +2951,8 @@ public:
         if (context->patternPropertiesValidators)\
             for (SizeType i_ = 0; i_ < context->patternPropertiesValidatorCount; i_++)\
                 static_cast<GenericSchemaValidator*>(context->patternPropertiesValidators[i_])->method arg2;\
+        if (context->containsValidator)\
+            static_cast<GenericSchemaValidator*>(context->containsValidator)->method arg2;\
     }
 
 #define RAPIDJSON_SCHEMA_HANDLE_END_(method, arg2)\
@@ -2922,6 +2988,26 @@ public:
         RAPIDJSON_SCHEMA_PRINT(Method, "GenericSchemaValidator::Key", str);
         if (!valid_) return false;
         AppendToken(str, len);
+
+        // propertyNames: validate the key as its own string instance against the subschema.
+        if (const SchemaType* propertyNamesSchema = CurrentSchema().GetPropertyNamesSchema()) {
+            ISchemaValidator* pn = CreateSchemaValidator(*propertyNamesSchema, false);
+            // Feed the property name as a complete string document.
+            static_cast<GenericSchemaValidator*>(pn)->String(str, len, true);
+            if (!pn->IsValid()) {
+                NotPropertyNames(str, len, pn);
+                DestroySchemaValidator(pn);
+                CurrentContext().invalidCode = kValidateErrorPropertyNames;
+                CurrentContext().invalidKeyword = SchemaType::GetValidateErrorKeyword(kValidateErrorPropertyNames).GetString();
+                if (!GetContinueOnErrors()) {
+                    valid_ = false;
+                    return valid_;
+                }
+            }
+            else
+                DestroySchemaValidator(pn);
+        }
+
         if (!CurrentSchema().Key(CurrentContext(), str, len, copy) && !GetContinueOnErrors()) {
             valid_ = false;
             return valid_;
@@ -3098,6 +3184,15 @@ private:
 
         if (!schemaStack_.Empty()) {
             Context& context = CurrentContext();
+
+            // Finish per-element 'contains' check (validator lived on the array context).
+            if (context.containsValidator) {
+                if (context.containsValidator->IsValid())
+                    context.containsMatched = true;
+                DestroySchemaValidator(context.containsValidator);
+                context.containsValidator = 0;
+            }
+
             // Only check uniqueness if there is a hasher
             if (hasher && context.valueUniqueness) {
                 HashCodeArray* a = static_cast<HashCodeArray*>(context.arrayElementHashCodes);

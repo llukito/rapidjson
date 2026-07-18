@@ -115,6 +115,10 @@ inline const RAPIDJSON_ERROR_CHARTYPE* GetValidateError_En(ValidateErrorCode val
         case kValidateErrorThen:                        return RAPIDJSON_ERROR_STRING("Property did not match the sub-schema specified by 'then' after matching 'if'.");
         case kValidateErrorElse:                        return RAPIDJSON_ERROR_STRING("Property did not match the sub-schema specified by 'else' after not matching 'if'.");
 
+        case kValidateErrorContains:                    return RAPIDJSON_ERROR_STRING("Array has no element that matches the 'contains' sub-schema.");
+
+        case kValidateErrorPropertyNames:               return RAPIDJSON_ERROR_STRING("Object has a property name that does not match the 'propertyNames' sub-schema.");
+
         default:                                        return RAPIDJSON_ERROR_STRING("Unknown error.");
     }
 }
